@@ -1,0 +1,27 @@
+# 数据集
+fire_dataset/
+
+# 训练产物
+board/runs/
+board/models/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# 运行数据
+board/alarm_data/
+board/flame_detect.log
+
+# 服务端
+server/uploads/
+server/flame_system.db
+
+# 测试视频/图片
+*.mp4
+*.avi
+test/
+test_result.jpg

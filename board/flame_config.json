@@ -1,0 +1,22 @@
+{
+    "device_mac": "AAABBBCCCDDD",
+    "server_url": "http://127.0.0.1:5000",
+    "camera_url": 0,
+    "model_path": "fire_yolov11.pt",
+    "use_npu": false,
+    "rknn_model_path": "fire_yolov11.rknn",
+    "conf_threshold": 0.35,
+    "iou_threshold": 0.45,
+    "detect_classes": [1],
+    "image_size": 640,
+    "video_duration": 5,
+    "heartbeat_interval": 60,
+    "save_dir": "alarm_data",
+    "longitude": "106.551556",
+    "latitude": "29.563009",
+    "location": "重庆理工大学花溪校区",
+    "camera_id": 1,
+    "device_id": 1,
+    "area_id": 1,
+    "model_info": "YOLOv11-FireDetect"
+}
