@@ -390,34 +390,32 @@ def dashboard():
 
     total_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult").fetchone()["c"]
     pending_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE Status='1'").fetchone()["c"]
-    reviewed_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE Status='3'").fetchone()["c"]
-    total_cameras = db.execute("SELECT COUNT(*) as c FROM T_Camera").fetchone()["c"]
     total_devices = db.execute("SELECT COUNT(*) as c FROM T_Device").fetchone()["c"]
-    offline_devices = db.execute("SELECT COUNT(*) as c FROM T_Device WHERE LastConnectTime < datetime('now','-6 hour')").fetchone()["c"]
 
-    area_stats = [dict(r) for r in db.execute(
-        "SELECT a.Name as area, COUNT(dr.Id) as count FROM T_Area a LEFT JOIN T_DetectResult dr ON a.Id=dr.AreaId GROUP BY a.Id").fetchall()]
+    today_start = datetime.now().strftime("%Y-%m-%d")
+    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    year_ago = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
 
-    time_stats = [dict(r) for r in db.execute(
-        "SELECT strftime('%Y-%m-%d', CreatTime) as date, COUNT(*) as count FROM T_DetectResult WHERE CreatTime > datetime('now','-30 day') GROUP BY date ORDER BY date").fetchall()]
+    today_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime >= ?", (today_start,)).fetchone()["c"]
+    week_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (week_ago,)).fetchone()["c"]
+    month_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (month_ago,)).fetchone()["c"]
+    year_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (year_ago,)).fetchone()["c"]
 
     recent_alarms = [dict(r) for r in db.execute(
-        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, d.Address as DeviceAddress FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_Device d ON dr.DeviceId=d.Id ORDER BY dr.CreatTime DESC LIMIT 20").fetchall()]
+        "SELECT dr.*, a.Name as AreaName FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id ORDER BY dr.CreatTime DESC LIMIT 30").fetchall()]
 
-    cameras = [dict(r) for r in db.execute(
-        "SELECT c.*, a.Name as AreaName, d.MAC as DeviceMAC FROM T_Camera c LEFT JOIN T_Area a ON c.AreaId=a.Id LEFT JOIN T_Device d ON c.DeviceId=d.Id").fetchall()]
-
-    camera_alarm_counts = {}
-    for cam in cameras:
-        cnt = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CameraId=?", (cam["Id"],)).fetchone()["c"]
-        camera_alarm_counts[cam["Id"]] = cnt
+    monthly_ranking = [dict(r) for r in db.execute(
+        "SELECT COALESCE(a.Name,'?') as name, COUNT(*) as count FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id WHERE dr.CreatTime > ? GROUP BY a.Id ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
+    max_rank = max([r["count"] for r in monthly_ranking]) if monthly_ranking else 1
 
     return render_template_string(DASHBOARD_TEMPLATE, user=user,
                                   total_alarms=total_alarms, pending_alarms=pending_alarms,
-                                  reviewed_alarms=reviewed_alarms, total_cameras=total_cameras,
-                                  total_devices=total_devices, offline_devices=offline_devices,
-                                  area_stats=json.dumps(area_stats), time_stats=json.dumps(time_stats),
-                                  recent_alarms=recent_alarms, cameras=cameras, camera_alarm_counts=camera_alarm_counts)
+                                  total_devices=total_devices,
+                                  today_count=today_count, week_count=week_count,
+                                  month_count=month_count, year_count=year_count,
+                                  recent_alarms=recent_alarms,
+                                   monthly_ranking=monthly_ranking, max_rank=max_rank)
 
 
 # --- Routes: System Config ---
@@ -1003,187 +1001,63 @@ body { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%
 """
 
 BASE_NAV = """
-<nav class="navbar navbar-inverse navbar-fixed-top" style="background:#1a1a2e;border:none;">
-<div class="container-fluid">
-<div class="navbar-header">
-    <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar">
-        <span class="sr-only">菜单</span><span class="icon-bar"></span><span class="icon-bar"></span><span class="icon-bar"></span>
-    </button>
-    <a class="navbar-brand" href="/dashboard" style="color:#e74c3c;">&#128293; 火焰预警平台</a>
+<header class="h-14 border-b border-slate-800/60 bg-slate-900/30 backdrop-blur-md px-6 flex items-center justify-between z-10 shrink-0">
+<div class="flex items-center gap-3">
+<span class="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee]"></span>
+<h1 class="text-md font-bold tracking-wider text-slate-100">视频 AI 智能识别及预警平台</h1>
 </div>
-<div class="collapse navbar-collapse" id="navbar">
-    <ul class="nav navbar-nav">
-        <li><a href="/dashboard"><i class="glyphicon glyphicon-dashboard"></i> 数据大屏</a></li>
-        {% if user.RoleName == '超级管理员' %}
-        <li class="dropdown"><a href="#" class="dropdown-toggle" data-toggle="dropdown">系统设置 <span class="caret"></span></a>
-            <ul class="dropdown-menu">
-                <li><a href="/admin/config">系统配置</a></li>
-                <li><a href="/admin/branch">部门管理</a></li>
-                <li><a href="/admin/user">用户管理</a></li>
-                <li><a href="/admin/role">角色管理</a></li>
-                <li><a href="/admin/dictionary">数据字典</a></li>
-            </ul>
-        </li>
-        <li class="dropdown"><a href="#" class="dropdown-toggle" data-toggle="dropdown">设备管理 <span class="caret"></span></a>
-            <ul class="dropdown-menu">
-                <li><a href="/admin/device">AI分析盒管理</a></li>
-                <li><a href="/admin/camera">摄像头管理</a></li>
-            </ul>
-        </li>
-        {% endif %}
-        <li class="dropdown"><a href="#" class="dropdown-toggle" data-toggle="dropdown">报警事件 <span class="caret"></span></a>
-            <ul class="dropdown-menu">
-                <li><a href="/admin/alarm">报警事件</a></li>
-                <li><a href="/admin/audit">事件处理审核</a></li>
-                <li><a href="/admin/camera_error">摄像头故障</a></li>
-                <li><a href="/admin/device_error">AI分析盒故障</a></li>
-            </ul>
-        </li>
-        {% if user.RoleName == '超级管理员' %}
-        <li class="dropdown"><a href="#" class="dropdown-toggle" data-toggle="dropdown">日志管理 <span class="caret"></span></a>
-            <ul class="dropdown-menu">
-                <li><a href="/admin/log/access">访问日志</a></li>
-                <li><a href="/admin/log/operate">操作日志</a></li>
-            </ul>
-        </li>
-        {% endif %}
-    </ul>
-    <ul class="nav navbar-nav navbar-right">
-        <li><a href="#"><i class="glyphicon glyphicon-user"></i> {{ user.Name }} ({{ user.RoleName }})</a></li>
-        <li><a href="/logout"><i class="glyphicon glyphicon-log-out"></i> 退出</a></li>
-    </ul>
-</div>
-</div>
+<nav class="flex items-center gap-6 text-sm text-slate-400">
+<a href="/dashboard" class="text-cyan-400 hover:text-cyan-300 transition no-underline">数据大屏</a>
+{% if user.RoleName == '超级管理员' %}
+<a href="/admin/device" class="hover:text-slate-200 transition no-underline">设备</a>
+<a href="/admin/config" class="hover:text-slate-200 transition no-underline">设置</a>
+{% endif %}
+<a href="/admin/alarm" class="hover:text-slate-200 transition no-underline">事件</a>
 </nav>
-<div style="padding-top:50px;"></div>
+<div class="flex items-center gap-4 text-sm">
+<span class="flex items-center gap-1.5 text-emerald-400 bg-emerald-500/10 px-2.5 py-0.5 rounded-full text-xs font-semibold border border-emerald-500/20">
+<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> 在线
+</span>
+<span class="text-slate-300">{{ user.Name }}</span>
+<a href="/logout" class="text-rose-400 hover:text-rose-300 transition no-underline">退出</a>
+</div>
+</header>
+<div class="pt-14"></div>
 """
 
 DASHBOARD_TEMPLATE = BASE_NAV + """
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8"><title>数据大屏 - 视频AI智能识别及预警管理系统</title>
-<link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/3.4.1/css/bootstrap.min.css" rel="stylesheet">
-<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
-<script src="https://cdn.bootcdn.net/ajax/libs/jquery/1.12.4/jquery.min.js"></script>
-<script src="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/3.4.1/js/bootstrap.min.js"></script>
-<style>
-body { background:#f0f2f5; font-family:"Microsoft YaHei",sans-serif; }
-.stat-card { background:white; border-radius:8px; padding:20px; margin-bottom:20px; box-shadow:0 2px 8px rgba(0,0,0,0.1); text-align:center; }
-.stat-card .num { font-size:36px; font-weight:bold; }
-.stat-card .label-text { color:#999; font-size:14px; }
-.stat-card.red { border-left:4px solid #e74c3c; }
-.stat-card.orange { border-left:4px solid #f39c12; }
-.stat-card.blue { border-left:4px solid #3498db; }
-.stat-card.green { border-left:4px solid #27ae60; }
-.stat-card.purple { border-left:4px solid #9b59b6; }
-.panel { border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1); }
-.table>tbody>tr>td { vertical-align:middle; }
-.alarm-image { max-width:80px; max-height:60px; border-radius:4px; cursor:pointer; }
-.badge-status-1 { background:#e74c3c; }
-.badge-status-2 { background:#f39c12; }
-.badge-status-3 { background:#27ae60; }
-</style>
-</head>
-<body>
-<div class="container-fluid" style="margin-top:60px;">
-    <h3 style="margin-bottom:20px;"><i class="glyphicon glyphicon-dashboard"></i> 数据大屏</h3>
-    <div class="row">
-        <div class="col-md-2 col-sm-4"><div class="stat-card red"><div class="num">{{ total_alarms }}</div><div class="label-text">总报警次数</div></div></div>
-        <div class="col-md-2 col-sm-4"><div class="stat-card orange"><div class="num">{{ pending_alarms }}</div><div class="label-text">待处理报警</div></div></div>
-        <div class="col-md-2 col-sm-4"><div class="stat-card green"><div class="num">{{ reviewed_alarms }}</div><div class="label-text">已审核报警</div></div></div>
-        <div class="col-md-2 col-sm-4"><div class="stat-card blue"><div class="num">{{ total_cameras }}</div><div class="label-text">摄像头总数</div></div></div>
-        <div class="col-md-2 col-sm-4"><div class="stat-card purple"><div class="num">{{ total_devices }}</div><div class="label-text">AI分析盒</div></div></div>
-        <div class="col-md-2 col-sm-4"><div class="stat-card" style="border-left:4px solid #e67e22;"><div class="num">{{ offline_devices }}</div><div class="label-text">离线设备</div></div></div>
-    </div>
-    <div class="row">
-        <div class="col-md-8">
-            <div class="panel panel-default">
-                <div class="panel-heading"><strong>摄像头分布地图</strong></div>
-                <div class="panel-body"><div id="mapChart" style="height:420px;"></div></div>
-            </div>
-        </div>
-        <div class="col-md-4">
-            <div class="panel panel-default">
-                <div class="panel-heading"><strong>区域报警统计</strong></div>
-                <div class="panel-body"><div id="areaChart" style="height:190px;"></div></div>
-            </div>
-            <div class="panel panel-default">
-                <div class="panel-heading"><strong>近30天报警趋势</strong></div>
-                <div class="panel-body"><div id="timeChart" style="height:190px;"></div></div>
-            </div>
-        </div>
-    </div>
-    <div class="row">
-        <div class="col-md-12">
-            <div class="panel panel-default">
-                <div class="panel-heading"><strong>最新报警事件</strong> <a href="/admin/alarm" class="btn btn-xs btn-danger pull-right">查看全部</a></div>
-                <div class="panel-body">
-                    <table class="table table-striped table-hover">
-                        <thead><tr><th>ID</th><th>图片</th><th>位置</th><th>摄像头</th><th>时间</th><th>状态</th><th>操作</th></tr></thead>
-                        <tbody>
-                        {% for a in recent_alarms %}
-                        <tr>
-                            <td>{{ a.Id }}</td>
-                            <td>{% if a.Picture %}<img src="{{ a.Picture }}" class="alarm-image" onclick="window.open('{{ a.Picture }}')">{% else %}-{% endif %}</td>
-                            <td>{{ a.Location or '-' }}</td>
-                            <td>{{ a.CameraName or '-' }}</td>
-                            <td>{{ a.CreatTime }}</td>
-                            <td>
-                                {% if a.Status == '1' %}<span class="badge badge-status-1">报警</span>
-                                {% elif a.Status == '2' %}<span class="badge badge-status-2">待审核</span>
-                                {% elif a.Status == '3' %}<span class="badge badge-status-3">已审核</span>
-                                {% endif %}
-                            </td>
-                            <td>
-                                {% if a.VideoUrl %}<a href="{{ a.VideoUrl }}" target="_blank" class="btn btn-xs btn-info">视频</a>{% endif %}
-                                <a href="{{ url_for('alarm_list') }}" class="btn btn-xs btn-warning">处理</a>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>视频 AI 智能识别及预警平台</title>
+<script src="https://cdn.tailwindcss.com"></script><style>
+.tech-grid{background-image:radial-gradient(rgba(255,255,255,0.05) 1px,transparent 0);background-size:24px 24px;}
+.scrollbar-thin::-webkit-scrollbar{width:4px;height:4px;}.scrollbar-thin::-webkit-scrollbar-track{background:transparent;}.scrollbar-thin::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:2px;}
+</style></head>
+<body class="bg-gradient-to-tr from-[#080b11] via-[#0d1527] to-[#080b11] text-slate-100 h-screen w-screen overflow-hidden flex flex-col font-sans">
+
+<main class="flex-1 grid grid-cols-12 gap-5 p-5 h-[calc(100vh-56px)] overflow-hidden">
+<section class="col-span-3 flex flex-col gap-5 h-full overflow-hidden"><div class="bg-slate-900/40 backdrop-blur-md border border-slate-800/60 rounded-2xl p-4 shadow-xl flex flex-col gap-3"><h2 class="text-sm font-semibold text-slate-200 flex items-center gap-2"><span class="w-1.5 h-3 bg-cyan-400 rounded-full"></span>条件查询</h2><div class="flex flex-col gap-2.5 text-xs"><div class="flex flex-col gap-1"><label class="text-slate-400">地址查询</label><input type="text" placeholder="输入地址搜索..." class="w-full bg-slate-950/40 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-cyan-500/50 transition"></div><div class="flex flex-col gap-1"><label class="text-slate-400">开始时间</label><input type="datetime-local" class="w-full bg-slate-950/40 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition"></div><div class="flex flex-col gap-1"><label class="text-slate-400">结束时间</label><input type="datetime-local" class="w-full bg-slate-950/40 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition"></div><div class="flex gap-2 mt-1"><button class="flex-1 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/30 text-cyan-400 py-2 rounded-lg font-semibold transition active:scale-95">查询</button><button class="flex-1 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 text-slate-300 py-2 rounded-lg font-semibold transition active:scale-95">重置</button></div></div></div>
+<div class="flex-1 bg-slate-900/40 backdrop-blur-md border border-slate-800/60 rounded-2xl p-4 shadow-xl flex flex-col gap-3 overflow-hidden"><h2 class="text-sm font-semibold text-slate-200 flex items-center gap-2"><span class="w-1.5 h-3 bg-rose-500 rounded-full"></span>报警记录 <span class="text-rose-400 text-xs ml-auto">{{ pending_alarms }}</span></h2>
+<div class="flex-1 overflow-y-auto pr-1 flex flex-col gap-2.5 text-xs scrollbar-thin">
+{% for a in recent_alarms %}<div class="p-2.5 rounded-lg bg-slate-950/20 border border-slate-800/40 flex items-center justify-between hover:bg-slate-800/20 transition"><div class="flex items-center gap-2 overflow-hidden"><span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse shrink-0"></span><span class="truncate text-slate-300">{{ a.Location or a.AreaName or '-' }}</span></div><span class="text-slate-500 text-[10px] shrink-0">{{ a.CreatTime[11:19] if a.CreatTime else '--' }}</span></div>{% else %}<div class="flex items-center justify-center h-full text-slate-600 text-xs">暂无报警记录</div>{% endfor %}
+</div></div></section>
+
+<section class="col-span-6 flex flex-col gap-5 h-full overflow-hidden"><div class="flex-1 bg-slate-900/40 backdrop-blur-md border border-slate-800/60 rounded-2xl p-4 shadow-xl flex flex-col gap-3 overflow-hidden"><div class="flex items-center justify-between"><h2 class="text-sm font-semibold text-slate-200 flex items-center gap-2"><span class="w-1.5 h-3 bg-cyan-400 rounded-full"></span>实时监控画面</h2><span class="text-[10px] text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded-full">1280x720 | WebSocket</span></div><div class="flex-1 bg-slate-950/60 rounded-xl relative overflow-hidden flex items-center justify-center tech-grid border border-slate-900"><img id="cameraFrame" class="hidden absolute inset-0 w-full h-full object-contain"><div id="videoOffline" class="flex flex-col items-center gap-2 z-10 text-center"><svg class="w-10 h-10 text-slate-600 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg><span class="text-slate-400 text-xs font-semibold">视频流未连接 (Camera Offline)</span></div><span id="videoTag" class="hidden absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-[9px] font-bold px-2 py-0.5 rounded uppercase tracking-wider">Offline</span></div></div>
+<div class="h-44 bg-slate-900/40 backdrop-blur-md border border-slate-800/60 rounded-2xl p-4 shadow-xl flex flex-col gap-2.5 overflow-hidden shrink-0"><h2 class="text-sm font-semibold text-slate-200 flex items-center gap-2"><span class="w-1.5 h-3 bg-orange-500 rounded-full"></span>疑似火灾抓拍记录</h2><div class="flex-1 flex gap-3 overflow-x-auto pb-1 scrollbar-thin">
+{% set snapshots = recent_alarms|selectattr('Picture')|list %}{% for a in snapshots[:4] %}<div class="w-44 shrink-0 rounded-xl bg-slate-950/20 border border-rose-500/20 p-1.5 flex flex-col gap-1.5"><div class="relative aspect-video rounded-lg overflow-hidden border border-rose-500/40"><img src="{{ a.Picture }}" class="w-full h-full object-cover" onerror="this.parentElement.parentElement.style.display='none'"><span class="absolute bottom-1 right-1 bg-rose-500 text-[9px] font-bold px-1 rounded shadow-md">疑似火灾</span></div><div class="flex items-center justify-between text-[10px]"><span class="text-orange-400 font-mono">{{ a.CreatTime[11:19] if a.CreatTime else '--' }}</span><span class="text-slate-400 truncate max-w-[80px]">{{ a.Location or '--' }}</span></div></div>{% else %}<div class="flex items-center justify-center w-full text-slate-600 text-xs">暂无抓拍记录</div>{% endfor %}
+</div></div></section>
+
+<section class="col-span-3 flex flex-col gap-5 h-full overflow-hidden"><div class="bg-slate-900/40 backdrop-blur-md border border-slate-800/60 rounded-2xl p-4 shadow-xl flex flex-col gap-3 items-center text-center"><div id="clock" class="text-3xl font-bold tracking-widest text-cyan-400 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.3)]">--</div><div class="text-xs text-slate-400 font-medium" id="liveDate">--</div></div>
+<div class="bg-slate-900/40 backdrop-blur-md border border-slate-800/60 rounded-2xl p-4 shadow-xl flex flex-col gap-3"><h2 class="text-sm font-semibold text-slate-200 flex items-center gap-2"><span class="w-1.5 h-3 bg-cyan-400 rounded-full"></span>预警数据统计</h2><div class="grid grid-cols-2 gap-3 text-center">
+{% set s = [('今日预警',today_count),('本周预警',week_count),('本月预警',month_count),('本年预警',year_count)] %}
+{% for l,v in s %}<div class="bg-slate-950/30 border border-slate-800/40 rounded-xl p-3 flex flex-col gap-1 relative overflow-hidden"><span class="text-slate-500 text-[10px]">{{ l }}</span><span class="text-xl font-bold text-cyan-400 font-mono">{{ v }}</span><span class="absolute bottom-0 left-0 right-0 h-0.5 bg-gradient-to-r from-transparent via-cyan-500/40 to-transparent"></span></div>{% endfor %}
+</div></div>
+<div class="flex-1 bg-slate-900/40 backdrop-blur-md border border-slate-800/60 rounded-2xl p-4 shadow-xl flex flex-col gap-3 overflow-hidden"><h2 class="text-sm font-semibold text-slate-200 flex items-center gap-2"><span class="w-1.5 h-3 bg-amber-500 rounded-full"></span>本月地区预警排行</h2><div class="flex-1 flex flex-col gap-4 justify-center text-xs">
+{% for item in monthly_ranking %}<div class="flex flex-col gap-1.5"><div class="flex justify-between text-[11px]"><span class="text-slate-300">{{ item.name }}</span><span class="text-amber-400 font-semibold">{{ item.count }} 次</span></div><div class="h-1.5 w-full bg-slate-950/60 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full" style="width:{{ (item.count/max_rank*100)|round|int }}%"></div></div></div>{% else %}<div class="flex items-center justify-center h-full text-slate-600 text-xs">暂无数据</div>{% endfor %}
+</div></div></section></main>
+
 <script>
-var mapChart = echarts.init(document.getElementById('mapChart'));
-var cameras = {{ cameras|tojson }};
-var alarmCounts = {{ camera_alarm_counts|tojson }};
-var mapData = cameras.map(function(c){
-    var lng = parseFloat(c.Longitude) || 106.55;
-    var lat = parseFloat(c.Latitude) || 29.56;
-    return {name: c.Name, value: [lng, lat, alarmCounts[c.Id] || 0], area: c.AreaName, device: c.DeviceMAC};
-});
-mapChart.setOption({
-    tooltip: {trigger:'item', formatter:function(p){return p.name+'<br/>报警次数:'+(p.value[2]||0)+'<br/>区域:'+(p.data.area||'');}},
-    xAxis:{type:'value',name:'经度'},
-    yAxis:{type:'value',name:'纬度'},
-    series:[{type:'scatter',symbolSize:function(val){return Math.max(15, (val[2]||0)*5+15);},
-        itemStyle:{color:'#e74c3c'},data:mapData,label:{show:true,formatter:'{b}',position:'top',fontSize:10}}]
-});
-
-var areaChart = echarts.init(document.getElementById('areaChart'));
-areaChart.setOption({
-    tooltip:{trigger:'item'},
-    series:[{type:'pie',radius:['40%','70%'],data:{{ area_stats|safe }},label:{formatter:'{b}\\n{d}%'}}]
-});
-
-var timeChart = echarts.init(document.getElementById('timeChart'));
-var timeData = {{ time_stats|safe }};
-timeChart.setOption({
-    tooltip:{trigger:'axis'},
-    xAxis:{type:'category',data:timeData.map(function(d){return d.date;}),axisLabel:{rotate:45,fontSize:10}},
-    yAxis:{type:'value'},
-    series:[{type:'line',data:timeData.map(function(d){return d.count;}),smooth:true,areaStyle:{color:'rgba(231,76,60,0.2)'},lineStyle:{color:'#e74c3c'},itemStyle:{color:'#e74c3c'}}]
-});
-
-window.addEventListener('resize',function(){mapChart.resize();areaChart.resize();timeChart.resize();});
-</script>
-</body>
-</html>
+function upd(){var n=new Date();document.getElementById('clock').textContent=n.toLocaleTimeString('zh-CN',{hour12:false});document.getElementById('liveDate').textContent=n.getFullYear()+'年'+(n.getMonth()+1).toString().padStart(2,'0')+'月'+n.getDate().toString().padStart(2,'0')+'日 星期'+['日','一','二','三','四','五','六'][n.getDay()];}upd();setInterval(upd,1000);
+var ws=new WebSocket('ws://127.0.0.1:8080');ws.binaryType='blob';ws.onopen=function(){document.getElementById('videoOffline').style.display='none';document.getElementById('cameraFrame').classList.remove('hidden');var t=document.getElementById('videoTag');t.classList.remove('hidden');t.textContent='Live';t.className='absolute top-3 left-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-bold px-2 py-0.5 rounded uppercase tracking-wider';};ws.onmessage=function(e){var u=URL.createObjectURL(e.data);var img=document.getElementById('cameraFrame');img.onload=function(){URL.revokeObjectURL(u);};img.src=u;};ws.onclose=ws.onerror=function(){document.getElementById('videoOffline').style.display='flex';document.getElementById('cameraFrame').classList.add('hidden');var t=document.getElementById('videoTag');t.classList.remove('hidden');t.textContent='Offline';t.className='absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-[9px] font-bold px-2 py-0.5 rounded uppercase tracking-wider';};
+</script></body></html>
 """
 
 CONFIG_TEMPLATE = BASE_NAV + """

@@ -23,6 +23,7 @@ from collections import deque
 import cv2
 import numpy as np
 import requests
+import websockets
 from ultralytics import YOLO
 
 logging.basicConfig(
@@ -90,6 +91,8 @@ class FlameDetector:
         self.record_start_time = 0
         self.detection_history = deque(maxlen=10)
         self.lock = threading.Lock()
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
 
     def load_model(self):
         logger.info(f"Loading YOLOv11 model: {self.cfg.model_path}")
@@ -126,7 +129,7 @@ class FlameDetector:
             self.cap = cv2.VideoCapture(cam)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera: {cam}")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.cap.set(cv2.CAP_PROP_FPS, 25)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
@@ -136,7 +139,7 @@ class FlameDetector:
         if self.cfg.use_npu and hasattr(self, "rknn"):
             return self._detect_rknn(frame)
         results = self.model(frame, conf=self.cfg.conf_threshold, iou=self.cfg.iou_threshold,
-                             classes=self.cfg.detect_classes or None, verbose=False)
+                             classes=self.cfg.detect_classes or None, imgsz=480, verbose=False, device=0)
         return results[0] if results else None
 
     def _detect_rknn(self, frame):
@@ -245,17 +248,13 @@ class FlameDetector:
 
     def should_trigger_alarm(self, detections):
         if not detections:
-            self.detection_history.append(0)
             return False
-        key = ",".join(sorted(str(d["class_id"]) for d in detections))
         now = time.time()
-        if key in self.alarm_cooldown and now - self.alarm_cooldown[key] < self.cooldown_seconds:
-            self.detection_history.append(0)
-            return False
-        self.alarm_cooldown[key] = now
-        self.detection_history.append(1)
-        if sum(self.detection_history) >= 2:
-            return True
+        for d in detections:
+            key = str(d["class_id"])
+            if key not in self.alarm_cooldown or now - self.alarm_cooldown[key] > self.cooldown_seconds:
+                self.alarm_cooldown[key] = now
+                return True
         return False
 
     def process_alarm(self, frame, result):
@@ -321,6 +320,36 @@ class FlameDetector:
             self.register_device()
             time.sleep(self.cfg.heartbeat_interval)
 
+    def _websocket_server(self, port=8080):
+        import asyncio
+
+        async def handler(ws):
+            while self.running:
+                with self._frame_lock:
+                    f = self._latest_frame.copy() if self._latest_frame is not None else None
+                if f is not None:
+                    _, jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                    try:
+                        await ws.send(jpg.tobytes())
+                    except Exception:
+                        break
+                await asyncio.sleep(0.033)
+
+        async def serve():
+            async with websockets.serve(handler, "0.0.0.0", port, ping_interval=None):
+                await asyncio.Future()
+
+        def run_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(serve())
+
+        threading.Thread(target=run_loop, daemon=True).start()
+
+    def set_latest_frame(self, frame):
+        with self._frame_lock:
+            self._latest_frame = frame
+
     def run(self):
         self.load_model()
         self.open_camera()
@@ -329,34 +358,38 @@ class FlameDetector:
         heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
         self.running = True
         heartbeat_thread.start()
+        threading.Thread(target=self._websocket_server, args=(8080,), daemon=True).start()
 
-        logger.info("Flame detection started")
+        logger.info("Flame detection started, WebSocket: ws://0.0.0.0:8080")
         frame_count = 0
+        last_print = 0
 
         try:
             while self.running:
                 ret, frame = self.cap.read()
                 if not ret:
-                    logger.warning("Failed to read frame, retrying...")
-                    time.sleep(0.1)
+                    time.sleep(0.01)
                     continue
-
-                h, w = frame.shape[:2]
-                if w > 960:
-                    frame = cv2.resize(frame, (960, int(h * 960 / w)))
-
-                self.frame_buffer.append(frame.copy())
 
                 frame_count += 1
-                if frame_count % 3 != 0:
-                    continue
 
                 result = self.detect_frame(frame)
+                annotated = frame.copy()
+                detections = self.get_detection_info(result, frame.shape) if result else []
 
-                if self.recording and self.video_writer:
-                    self.video_writer.write(frame)
+                for det in detections:
+                    x1, y1, x2, y2 = det["bbox"]
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(annotated, f"{det['class_name']} {det['confidence']:.2f}",
+                                (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
-                if self.has_flame(result):
+                self.set_latest_frame(annotated)
+
+                if detections:
+                    if time.time() - last_print > 2:
+                        for det in detections:
+                            print(f"  🔥 {det['class_name']} conf={det['confidence']:.2f}")
+                        last_print = time.time()
                     self.process_alarm(frame, result)
 
         except KeyboardInterrupt:

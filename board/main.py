@@ -7,6 +7,8 @@
 import os
 import sys
 
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flame_detect import FlameDetector, Config
