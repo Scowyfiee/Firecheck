@@ -44,7 +44,7 @@ python3 run_train.py
 ```
 
 自动检测已有模型，用低学习率继续优化。训练完成后模型位置：
-- `runs/detect/fire_detect_continue/weights/best.pt`
+- `runs/detect/fire_detect/weights/best.pt` (高精度模型，支持火焰与烟雾双通道检测)
 
 ---
 
@@ -82,14 +82,22 @@ python3 web_server.py
 
 ---
 
-## 第四步：启动火焰检测端
+## 第四步：启动火焰与烟雾检测端
 
 **终端2：**
 
 ```bash
 cd fire/board
+# 启动检测端：
 python3 main.py
+
+# 启动后，终端会进入交互式初始化配置面板：
+# - 选择 1: 快速启动 (直接加载配置文件默认参数)
+# - 选择 2: 自定义启动 (交互式手动输入/修改当前地点的端口、地点、摄像头源和 ID)
 ```
+
+> [!NOTE]
+> 边缘检测端启动后，会通过心跳机制向 Web 服务端上报自定义的 **WebSocket 端口 (port)** 和 **安装地点 (location)**，Web 端会智能接收并记录各个端口，从而在前端大屏流畅切换和扫描不同的摄像头画面。
 
 ---
 
@@ -116,8 +124,8 @@ python3 main.py
 {
     "server_url": "http://127.0.0.1:5000",
     "camera_url": 0,
-    "model_path": "runs/detect/fire_detect_continue/weights/best.pt",
-    "detect_classes": [1],
+    "model_path": "runs/detect/fire_detect/weights/best.pt",
+    "detect_classes": [0, 1],
     "conf_threshold": 0.35
 }
 ```
@@ -229,8 +237,8 @@ scp -r fire/board/ orangepi@<开发板IP>:~/fire_board/
 {
     "server_url": "http://<你PC的IP>:5000",
     "camera_url": 0,
-    "model_path": "runs/detect/fire_detect_continue/weights/best.pt",
-    "detect_classes": [1],
+    "model_path": "runs/detect/fire_detect/weights/best.pt",
+    "detect_classes": [0, 1],
     "conf_threshold": 0.35
 }
 ```

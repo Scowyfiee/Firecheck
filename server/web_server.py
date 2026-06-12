@@ -244,6 +244,11 @@ CREATE TABLE IF NOT EXISTS T_UserLoginLog (
         db.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        db.execute("ALTER TABLE T_Camera ADD COLUMN WsPort INTEGER DEFAULT 9999")
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
     db.close()
     seed_data()
 
@@ -409,6 +414,7 @@ def dashboard():
 
     true_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='火灾已确认并报警'").fetchone()["c"]
     false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
+    missed_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='漏报记录'").fetchone()["c"]
 
     recent_alarms = [dict(r) for r in db.execute(
         "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.Status ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
@@ -428,6 +434,7 @@ def dashboard():
                                   today_count=today_count, week_count=week_count,
                                   month_count=month_count, year_count=year_count,
                                   true_count=true_count, false_count=false_count,
+                                  missed_count=missed_count,
                                   recent_alarms=recent_alarms,
                                   monthly_ranking=monthly_ranking, max_rank=max_rank,
                                   earliest_time=earliest_time,
@@ -941,6 +948,16 @@ def api_heartbeat():
             auto_err = "yes" if data.get("status") != "online" else "no"
             db.execute("""INSERT INTO T_Device (MAC, ModelInfo, LastConnectTime, AutoGenerateError)
                 VALUES (?,?,?,?)""", (mac, data.get("model_info", "YOLOv11"), now, auto_err))
+        
+        camera_id = data.get("camera_id")
+        if camera_id:
+            loc = data.get("location")
+            port = data.get("websocket_port")
+            camera = db.execute("SELECT * FROM T_Camera WHERE Id=?", (camera_id,)).fetchone()
+            if camera:
+                db.execute("UPDATE T_Camera SET Name=COALESCE(?, Name), WsPort=COALESCE(?, WsPort) WHERE Id=?", (loc, port, camera_id))
+            else:
+                db.execute("INSERT INTO T_Camera (Id, Name, WsPort, DeviceId) VALUES (?, ?, ?, ?)", (camera_id, loc, port, did))
         db.commit()
         site = db.execute("SELECT * FROM T_Site WHERE Id=1").fetchone()
         config = {"thresh": site["thresh"], "width": site["width"], "height": site["height"],
@@ -986,12 +1003,13 @@ def api_alarm():
         except Exception:
             pass
 
-        db.execute("""INSERT INTO T_DetectResult (Longitude, Latitude, Location, Picture, VideoUrl, AreaId, CreatTime, CameraId, DeviceId, Status, Confidence)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        desc = request.form.get("description", "")
+        db.execute("""INSERT INTO T_DetectResult (Longitude, Latitude, Location, Picture, VideoUrl, AreaId, CreatTime, CameraId, DeviceId, Status, Confidence, Description)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                    (request.form.get("longitude", ""), request.form.get("latitude", ""),
                     request.form.get("location", ""), picture_path, video_path,
                     int(request.form.get("area_id", 1)), now,
-                    int(request.form.get("camera_id", 1)), int(request.form.get("device_id", 1)), "1", max_conf))
+                    int(request.form.get("camera_id", 1)), int(request.form.get("device_id", 1)), "1", max_conf, desc))
         db.commit()
         aid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
         logger.info(f"Alarm received: id={aid}")
@@ -1047,6 +1065,7 @@ def api_stats():
 
     true_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='火灾已确认并报警'").fetchone()["c"]
     false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
+    missed_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='漏报记录'").fetchone()["c"]
 
     earliest_row = db.execute("SELECT MIN(CreatTime) as m FROM T_DetectResult").fetchone()
     earliest_time = earliest_row["m"] if earliest_row and earliest_row["m"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1065,6 +1084,7 @@ def api_stats():
         "year_count": year_count,
         "true_count": true_count,
         "false_count": false_count,
+        "missed_count": missed_count,
         "pending_alarms": pending_alarms,
         "recent_alarms": recent_alarms,
         "monthly_ranking": monthly_ranking,
@@ -1271,17 +1291,38 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       <div class="relative border-l border-slate-800 ml-2 pl-4 flex flex-col gap-3 py-2" id="timelineList">
         {% for a in recent_alarms %}
         <div class="relative mb-2">
-          <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border border-rose-500 bg-slate-950 shadow-[0_0_6px_#f43f5e] flex items-center justify-center">
-            <span class="w-1 h-1 rounded-full bg-rose-500 animate-pulse"></span>
+          <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-slate-950 flex items-center justify-center
+            {% if a.Status == '1' %} border-rose-500 shadow-[0_0_6px_#f43f5e]
+            {% elif a.OperateResult == '误报无需处理' %} border-emerald-500 shadow-[0_0_6px_#10b981]
+            {% elif a.OperateResult == '漏报记录' %} border-amber-500 shadow-[0_0_6px_#f59e0b]
+            {% else %} border-blue-500 shadow-[0_0_6px_#3b82f6]
+            {% endif %}">
+            <span class="w-1.5 h-1.5 rounded-full
+              {% if a.Status == '1' %} bg-rose-500 animate-pulse
+              {% elif a.OperateResult == '误报无需处理' %} bg-emerald-500
+              {% elif a.OperateResult == '漏报记录' %} bg-amber-500 animate-pulse
+              {% else %} bg-blue-500
+              {% endif %}"></span>
           </span>
           <div class="bg-slate-950/25 border border-slate-800 rounded-xl p-3 flex flex-col gap-1 transition duration-200 cursor-pointer hover:border-cyan-500/40 hover:bg-slate-950/40" onclick="showAlarmDetail({{ a.Id }})">
             <div class="flex justify-between items-center">
-              <span class="text-rose-400 font-semibold text-[10px]">火焰预警 {% if a.Confidence %}({{ (a.Confidence*100)|round(1) }}%){% endif %}</span>
-              <span class="text-slate-500 text-[9px] font-mono">{{ a.CreatTime or '--' }}</span>
+              <span class="text-rose-400 font-semibold text-[10px]">{% if a.Description and '烟雾' in a.Description and '火焰' not in a.Description %}烟雾预警{% else %}火焰预警{% endif %} {% if a.Confidence %}({{ (a.Confidence*100)|round(1) }}%){% endif %}</span>
+              {% if a.Status == '1' %}
+              <span class="text-[8px] bg-rose-500/10 text-rose-400 border border-rose-500/20 px-1.5 py-0.5 rounded font-bold">待处理</span>
+              {% elif a.OperateResult == '误报无需处理' %}
+              <span class="text-[8px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/35 px-1.5 py-0.5 rounded font-bold">排除误报</span>
+              {% elif a.OperateResult == '漏报记录' %}
+              <span class="text-[8px] bg-amber-500/15 text-amber-400 border border-amber-500/35 px-1.5 py-0.5 rounded font-bold animate-pulse">漏报记录</span>
+              {% else %}
+              <span class="text-[8px] bg-blue-500/15 text-blue-400 border border-blue-500/35 px-1.5 py-0.5 rounded font-bold">已处理</span>
+              {% endif %}
             </div>
-            <div class="flex justify-between items-center text-[10px] text-slate-350">
+            <div class="flex justify-between items-center text-[10px] text-slate-350 mt-1">
               <span class="truncate max-w-[120px]">{{ a.Location or a.AreaName or '未知位置' }}</span>
               <span class="text-cyan-400 font-mono text-[9px] truncate max-w-[80px]">{{ a.CameraName or '摄像头1' }}</span>
+            </div>
+            <div class="flex justify-between items-center text-[8px] text-slate-500">
+              <span>{{ a.CreatTime or '--' }}</span>
             </div>
           </div>
         </div>
@@ -1305,7 +1346,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       <div class="flex items-center gap-2">
         <select id="cameraSelector" onchange="changeCameraStream()" class="bg-slate-950/50 border border-slate-800 rounded px-2 py-0.5 text-slate-300 focus:outline-none focus:border-cyan-500/50 transition text-[10px] font-semibold">
           {% for c in cameras %}
-          <option value="{{ c.Id }}" data-port="{{ 9999 + loop.index0 }}">{{ c.Name }} (Port {{ 9999 + loop.index0 }})</option>
+          <option value="{{ c.Id }}" data-port="{{ c.WsPort or 9999 }}">{{ c.Name }} (Port {{ c.WsPort or 9999 }})</option>
           {% else %}
           <option value="1" data-port="9999">默认相机 (Port 9999)</option>
           {% endfor %}
@@ -1405,11 +1446,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-rose-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
       
-      <!-- Real vs False Alarms Summary -->
-      <div class="col-span-2 bg-slate-950/30 border border-slate-900 rounded-xl p-1.5 text-[9px] text-slate-450 flex items-center justify-around">
-        <span>🔥 确认火警: <strong class="text-rose-400 font-bold" id="statTrueCount">{{ true_count }}</strong> 次</span>
-        <span class="text-slate-800">|</span>
-        <span>排除误报: <strong class="text-emerald-400 font-bold" id="statFalseCount">{{ false_count }}</strong> 次</span>
+      <!-- Accuracy Ratio Pie Chart -->
+      <div class="col-span-2 bg-slate-950/30 border border-slate-900 rounded-xl p-2 flex flex-col gap-1 h-36 relative overflow-hidden">
+        <span class="text-[8px] font-bold text-slate-450 uppercase tracking-wider flex items-center gap-1">
+          <span class="w-1 h-2 bg-rose-500 rounded-full"></span>
+          警情比例 (真火 / 误报 / 漏报)
+        </span>
+        <div id="accuracyChart" class="flex-1 w-full h-full"></div>
       </div>
     </div>
   </div>
@@ -1637,10 +1680,60 @@ function clearAllAlarms() {
 }
 
 var trendChartInstance = null;
+var accuracyChartInstance = null;
 
 // ECharts Themes & Configurations
 const chartTextColor = '#94a3b8';
 const chartLineColor = 'rgba(51, 65, 85, 0.3)';
+
+const accuracyOption = {
+  backgroundColor: 'transparent',
+  tooltip: {
+    trigger: 'item',
+    formatter: '{b}: {c} 次 ({d}%)',
+    backgroundColor: 'rgba(15, 23, 42, 0.9)',
+    borderColor: 'rgba(34, 211, 238, 0.3)',
+    textStyle: { color: '#f1f5f9', fontSize: 10 },
+    borderWidth: 1
+  },
+  legend: {
+    orient: 'vertical',
+    right: '5%',
+    top: 'center',
+    itemWidth: 8,
+    itemHeight: 8,
+    textStyle: { color: '#94a3b8', fontSize: 8 }
+  },
+  series: [
+    {
+      name: '警情比例',
+      type: 'pie',
+      radius: ['50%', '80%'],
+      center: ['35%', '50%'],
+      avoidLabelOverlap: false,
+      label: {
+        show: false,
+        position: 'center'
+      },
+      emphasis: {
+        label: {
+          show: true,
+          fontSize: 9,
+          fontWeight: 'bold',
+          color: '#f1f5f9'
+        }
+      },
+      labelLine: {
+        show: false
+      },
+      data: [
+        { value: {{ true_count }}, name: '确认火警', itemStyle: { color: '#f43f5e' } },
+        { value: {{ false_count }}, name: '误报记录', itemStyle: { color: '#10b981' } },
+        { value: {{ missed_count }}, name: '漏报记录', itemStyle: { color: '#f59e0b' } }
+      ]
+    }
+  ]
+};
 
 const trendOption = {
   backgroundColor: 'transparent',
@@ -1747,6 +1840,7 @@ function showAlarmDetail(id) {
   if (video && noVideo) {
     if (a.videoUrl) {
       video.src = a.videoUrl;
+      video.load();
       video.classList.remove('hidden');
       noVideo.classList.add('hidden');
     } else {
@@ -1759,16 +1853,27 @@ function showAlarmDetail(id) {
   const statusEl = document.getElementById('modalAlarmStatus');
   if (statusEl) {
     if (a.status === '1') {
-      statusEl.textContent = '报警 (未处理)';
+      statusEl.textContent = '待处理';
       statusEl.className = 'text-rose-400 font-bold';
       const pForm = document.getElementById('modalProcessForm');
       if (pForm) pForm.classList.remove('hidden');
       const pInfo = document.getElementById('modalProcessedInfo');
       if (pInfo) pInfo.classList.add('hidden');
     } else {
-      const statusText = a.status === '2' ? '待审核' : '已审核';
+      let statusText = '已处理';
+      let statusClass = 'text-emerald-400 font-bold';
+      if (a.result === '误报无需处理') {
+        statusText = '排除误报';
+        statusClass = 'text-emerald-400 font-bold';
+      } else if (a.result === '漏报记录') {
+        statusText = '漏报记录';
+        statusClass = 'text-amber-400 font-bold animate-pulse';
+      } else {
+        statusText = '已处理';
+        statusClass = 'text-blue-400 font-bold';
+      }
       statusEl.textContent = statusText;
-      statusEl.className = a.status === '2' ? 'text-amber-450 font-bold' : 'text-emerald-450 font-bold';
+      statusEl.className = statusClass;
       
       const pForm = document.getElementById('modalProcessForm');
       if (pForm) pForm.classList.add('hidden');
@@ -1900,19 +2005,46 @@ function fetchRealtimeData() {
             const camera = a.CameraName || '摄像头1';
             const confBadge = a.Confidence ? '(' + (a.Confidence * 100).toFixed(1) + '%)' : '';
             
+            let dotBorderClass = 'border-rose-500 shadow-[0_0_6px_#f43f5e]';
+            let dotBgClass = 'bg-rose-500 animate-pulse';
+            let statusBadge = '<span class="text-[8px] bg-rose-500/10 text-rose-400 border border-rose-500/20 px-1.5 py-0.5 rounded font-bold">待处理</span>';
+            
+            if (a.Status === '1') {
+              dotBorderClass = 'border-rose-500 shadow-[0_0_6px_#f43f5e]';
+              dotBgClass = 'bg-rose-500 animate-pulse';
+              statusBadge = '<span class="text-[8px] bg-rose-500/10 text-rose-400 border border-rose-500/20 px-1.5 py-0.5 rounded font-bold">待处理</span>';
+            } else if (a.OperateResult === '误报无需处理') {
+              dotBorderClass = 'border-emerald-500 shadow-[0_0_6px_#10b981]';
+              dotBgClass = 'bg-emerald-500';
+              statusBadge = '<span class="text-[8px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/35 px-1.5 py-0.5 rounded font-bold">排除误报</span>';
+            } else if (a.OperateResult === '漏报记录') {
+              dotBorderClass = 'border-amber-500 shadow-[0_0_6px_#f59e0b]';
+              dotBgClass = 'bg-amber-500 animate-pulse';
+              statusBadge = '<span class="text-[8px] bg-amber-500/15 text-amber-400 border border-amber-500/35 px-1.5 py-0.5 rounded font-bold animate-pulse">漏报记录</span>';
+            } else {
+              dotBorderClass = 'border-blue-500 shadow-[0_0_6px_#3b82f6]';
+              dotBgClass = 'bg-blue-500';
+              statusBadge = '<span class="text-[8px] bg-blue-500/15 text-blue-400 border border-blue-500/35 px-1.5 py-0.5 rounded font-bold">已处理</span>';
+            }
+
+            const typeName = (a.Description && a.Description.includes('烟雾') && !a.Description.includes('火焰')) ? '烟雾预警' : '火焰预警';
+
             timelineHtml += `
             <div class="relative mb-2">
-              <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border border-rose-500 bg-slate-950 shadow-[0_0_6px_#f43f5e] flex items-center justify-center">
-                <span class="w-1 h-1 rounded-full bg-rose-500 animate-pulse"></span>
+              <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-slate-950 flex items-center justify-center ${dotBorderClass}">
+                <span class="w-1.5 h-1.5 rounded-full ${dotBgClass}"></span>
               </span>
               <div class="bg-slate-950/25 border border-slate-800 rounded-xl p-3 flex flex-col gap-1 transition duration-200 cursor-pointer hover:border-cyan-500/40 hover:bg-slate-950/40" onclick="showAlarmDetail(${a.Id})">
                 <div class="flex justify-between items-center">
-                  <span class="text-rose-400 font-semibold text-[10px]">火焰预警 ${confBadge}</span>
-                  <span class="text-slate-500 text-[9px] font-mono">${timeStr}</span>
+                  <span class="text-rose-400 font-semibold text-[10px]">${typeName} ${confBadge}</span>
+                  ${statusBadge}
                 </div>
-                <div class="flex justify-between items-center text-[10px] text-slate-350">
+                <div class="flex justify-between items-center text-[10px] text-slate-350 mt-1">
                   <span class="truncate max-w-[120px]">${location}</span>
                   <span class="text-cyan-400 font-mono text-[9px] truncate max-w-[80px]">${camera}</span>
+                </div>
+                <div class="flex justify-between items-center text-[8px] text-slate-500">
+                  <span>${timeStr}</span>
                 </div>
               </div>
             </div>`;
@@ -1984,6 +2116,17 @@ function fetchRealtimeData() {
           series: [{ data: yData }]
         });
       }
+      if (accuracyChartInstance) {
+        accuracyChartInstance.setOption({
+          series: [{
+            data: [
+              { value: data.true_count || 0, name: '确认火警', itemStyle: { color: '#f43f5e' } },
+              { value: data.false_count || 0, name: '误报记录', itemStyle: { color: '#10b981' } },
+              { value: data.missed_count || 0, name: '漏报记录', itemStyle: { color: '#f59e0b' } }
+            ]
+          }]
+        });
+      }
     })
     .catch(err => console.error('Error fetching stats:', err));
 }
@@ -1991,6 +2134,7 @@ function fetchRealtimeData() {
 // Window resizing for ECharts responsive
 window.addEventListener('resize', function() {
   if (trendChartInstance) trendChartInstance.resize();
+  if (accuracyChartInstance) accuracyChartInstance.resize();
 });
 
 // Initialization
@@ -1999,6 +2143,11 @@ document.addEventListener("DOMContentLoaded", function() {
   if (trendDom) {
     trendChartInstance = echarts.init(trendDom);
     trendChartInstance.setOption(trendOption);
+  }
+  const accuracyDom = document.getElementById('accuracyChart');
+  if (accuracyDom) {
+    accuracyChartInstance = echarts.init(accuracyDom);
+    accuracyChartInstance.setOption(accuracyOption);
   }
   
   fetchRealtimeData();
@@ -2081,6 +2230,7 @@ document.addEventListener("DOMContentLoaded", function() {
             <select name="OperateResult" class="w-full bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
               <option value="火灾已确认并报警">火灾已确认并报警</option>
               <option value="误报无需处理">误报无需处理</option>
+              <option value="漏报记录">漏报记录</option>
               <option value="其它已处理">其它已处理</option>
             </select>
           </div>
@@ -3302,14 +3452,16 @@ ALARM_TEMPLATE = make_admin_template("报警事件", """
           <td class="px-4 py-3 text-slate-400 font-mono alarm-time">{{ a.CreatTime }}</td>
           <td class="px-4 py-3 alarm-status" data-status="{{ a.Status }}">
             {% if a.Status=='1' %}
-            <span class="px-2.5 py-0.5 rounded-full bg-rose-500/10 text-rose-455 border border-rose-500/20 text-[10px] font-bold">报警 (未处理)</span>
-            {% elif a.Status=='2' %}
-            <span class="px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[10px] font-semibold">待审核</span>
-            {% elif a.Status=='3' %}
-            <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-semibold">已审核</span>
+            <span class="px-2.5 py-0.5 rounded-full bg-rose-500/10 text-rose-455 border border-rose-500/20 text-[10px] font-bold">待处理</span>
+            {% elif a.OperateResult=='误报无需处理' %}
+            <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-semibold">排除误报</span>
+            {% elif a.OperateResult=='漏报记录' %}
+            <span class="px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[10px] font-bold animate-pulse">漏报记录</span>
+            {% else %}
+            <span class="px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] font-semibold">已处理</span>
             {% endif %}
           </td>
-          <td class="px-4 py-3 text-slate-300 alarm-result">{{ a.OperateResult or '--' }}</td>
+          <td class="px-4 py-3 text-slate-350 alarm-result font-medium">{{ a.OperateResult or '--' }}</td>
           <td class="px-4 py-3 text-slate-400">{{ a.OperatorName or '--' }}</td>
           <td class="px-4 py-3 flex items-center gap-2">
             <button class="bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/20 text-cyan-400 px-2.5 py-1 rounded-md font-medium transition active:scale-95" onclick="showAlarmDetail({{ a.Id }})">详情</button>
@@ -3403,6 +3555,7 @@ ALARM_TEMPLATE = make_admin_template("报警事件", """
             <select name="OperateResult" class="w-full bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
               <option value="火灾已确认并报警">火灾已确认并报警</option>
               <option value="误报无需处理">误报无需处理</option>
+              <option value="漏报记录">漏报记录</option>
               <option value="其它已处理">其它已处理</option>
             </select>
           </div>
@@ -3509,6 +3662,7 @@ function showAlarmDetail(id) {
     if (video && noVideo) {
       if (a.videoUrl) {
         video.src = a.videoUrl;
+        video.load();
         video.classList.remove('hidden');
         noVideo.classList.add('hidden');
       } else {
@@ -3521,15 +3675,26 @@ function showAlarmDetail(id) {
     const statusEl = document.getElementById('modalAlarmStatus');
     if (statusEl) {
       if (a.status === '1') {
-        statusEl.textContent = '报警 (未处理)';
-        statusEl.className = 'text-rose-450 font-bold';
+        statusEl.textContent = '待处理';
+        statusEl.className = 'text-rose-455 font-bold';
         if (formEl) formEl.classList.remove('hidden');
         const pInfo = document.getElementById('modalProcessedInfo');
         if (pInfo) pInfo.classList.add('hidden');
       } else {
-        const statusText = a.status === '2' ? '待审核' : '已审核';
+        let statusText = '已处理';
+        let statusClass = 'text-emerald-450 font-bold';
+        if (a.result === '误报无需处理') {
+          statusText = '排除误报';
+          statusClass = 'text-emerald-450 font-bold';
+        } else if (a.result === '漏报记录') {
+          statusText = '漏报记录';
+          statusClass = 'text-amber-450 font-bold animate-pulse';
+        } else {
+          statusText = '已处理';
+          statusClass = 'text-blue-450 font-bold';
+        }
         statusEl.textContent = statusText;
-        statusEl.className = a.status === '2' ? 'text-amber-450 font-bold' : 'text-emerald-450 font-bold';
+        statusEl.className = statusClass;
         
         if (formEl) formEl.classList.add('hidden');
         const pInfo = document.getElementById('modalProcessedInfo');

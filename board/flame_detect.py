@@ -40,12 +40,12 @@ class Config:
             "device_mac": self._get_mac(),
             "server_url": "http://127.0.0.1:5000",
             "camera_url": 0,
-            "model_path": os.path.join(os.path.dirname(__file__), "models", "fire_yolov11.pt"),
+            "model_path": os.path.join(os.path.dirname(__file__), "runs", "detect", "fire_detect", "weights", "best.pt"),
             "use_npu": False,
             "rknn_model_path": os.path.join(os.path.dirname(__file__), "models", "fire_yolov11.rknn"),
             "conf_threshold": 0.35,
             "iou_threshold": 0.45,
-            "detect_classes": [0],
+            "detect_classes": [0, 1],
             "image_size": 640,
             "video_duration": 5,
             "heartbeat_interval": 60,
@@ -56,6 +56,7 @@ class Config:
             "camera_id": 1,
             "device_id": 1,
             "area_id": 1,
+            "ws_port": 9999,
         }
         if os.path.exists(config_file):
             with open(config_file, "r") as f:
@@ -85,7 +86,7 @@ class FlameDetector:
         self.running = False
         self.alarm_cooldown = {}
         self.cooldown_seconds = 15
-        self.frame_buffer = deque(maxlen=config.video_duration * 30)
+        self.frame_buffer = deque(maxlen=60) # Store up to 60 pre-alarm frames for memory efficiency
         self.video_writer = None
         self.recording = False
         self.record_start_time = 0
@@ -209,29 +210,40 @@ class FlameDetector:
         logger.info(f"Alarm image saved: {filepath}")
         return filepath, filename
 
-    def start_recording(self):
+    def start_recording(self, frame_w=1280, frame_h=720):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"alarm_{ts}.mp4"
         filepath = os.path.join(self.cfg.save_dir, filename)
         
+        fps = getattr(self, "fps", 20.0)
+        if fps <= 0:
+            fps = 20.0
+            
         # Try avc1 first for HTML5 compatibility, fallback to mp4v if unavailable
         try:
             fourcc = cv2.VideoWriter_fourcc(*"avc1")
-            self.video_writer = cv2.VideoWriter(filepath, fourcc, 20.0, (1280, 720))
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
             if not self.video_writer.isOpened():
                 raise Exception("avc1 writer not opened")
         except Exception:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self.video_writer = cv2.VideoWriter(filepath, fourcc, 20.0, (1280, 720))
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
             
         self.recording = True
         self.record_start_time = time.time()
         self._recorded_frames_filepath = filepath
         self._recorded_frames_filename = filename
-        for f in self.frame_buffer:
-            self.video_writer.write(f)
+        
+        # Write any buffered frames that match the size
+        for f in list(self.frame_buffer):
+            fh, fw = f.shape[:2]
+            if fw == frame_w and fh == frame_h:
+                try:
+                    self.video_writer.write(f)
+                except Exception as e:
+                    logger.error(f"Error writing buffered frame: {e}")
         self.frame_buffer.clear()
-        logger.info(f"Recording started: {filepath}")
+        logger.info(f"Recording started with size ({frame_w}x{frame_h}) at {fps} FPS: {filepath}")
 
     def stop_recording(self):
         if self.video_writer:
@@ -268,6 +280,13 @@ class FlameDetector:
                 with open(video_path, "rb") as f:
                     files["video"] = (video_filename, f.read(), "video/mp4")
 
+            # Format descriptive text for classes and confidences
+            detected_items = []
+            for d in detections:
+                c_name = "烟雾" if d["class_name"] == "smoke" else ("火焰" if d["class_name"] == "fire" else d["class_name"])
+                detected_items.append(f"{c_name} ({d['confidence'] * 100:.1f}%)")
+            description = "检测到: " + ", ".join(detected_items)
+
             data = {
                 "device_mac": self.cfg.device_mac,
                 "device_id": self.cfg.device_id,
@@ -278,6 +297,7 @@ class FlameDetector:
                 "location": self.cfg.location,
                 "detections": json.dumps(detections),
                 "timestamp": datetime.now().isoformat(),
+                "description": description,
             }
             url = f"{self.cfg.server_url}/api/alarm"
             resp = requests.post(url, data=data, files=files, timeout=30)
@@ -313,7 +333,8 @@ class FlameDetector:
 
         image_path, image_filename = self.save_alarm_image(frame, detections, event_id)
 
-        self.start_recording()
+        h, w = frame.shape[:2]
+        self.start_recording(w, h)
         time.sleep(self.cfg.video_duration)
         video_path, video_filename = self.stop_recording()
 
@@ -326,6 +347,7 @@ class FlameDetector:
     def register_device(self):
         try:
             url = f"{self.cfg.server_url}/api/device/heartbeat"
+            ws_port = getattr(self.cfg, "ws_port", 9999)
             data = {
                 "device_mac": self.cfg.device_mac,
                 "device_id": self.cfg.device_id,
@@ -335,6 +357,8 @@ class FlameDetector:
                 "model_info": getattr(self.cfg, "model_info", "YOLOv11"),
                 "cpu_usage": self._get_cpu_usage(),
                 "memory_usage": self._get_memory_usage(),
+                "websocket_port": ws_port,
+                "location": self.cfg.location,
             }
             resp = requests.post(url, json=data, timeout=10)
             return resp.status_code == 200
@@ -413,7 +437,8 @@ class FlameDetector:
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
         
         # Start WebSocket Server
-        threading.Thread(target=self._websocket_server, args=(9999,), daemon=True).start()
+        ws_port = getattr(self.cfg, "ws_port", 9999)
+        threading.Thread(target=self._websocket_server, args=(ws_port,), daemon=True).start()
 
         logger.info("Flame detection started. Main loop running.")
         frame_count = 0
@@ -452,6 +477,16 @@ class FlameDetector:
                             continue
 
                 frame_count += 1
+                
+                # Maintain the rolling frame buffer for pre-alarm recording
+                self.frame_buffer.append(frame.copy())
+
+                # If recording is active, write the current frame to the video writer
+                if self.recording and self.video_writer:
+                    try:
+                        self.video_writer.write(frame)
+                    except Exception as e:
+                        logger.error(f"Error writing frame to video writer: {e}")
 
                 if getattr(self, "is_mock", False):
                     result = None

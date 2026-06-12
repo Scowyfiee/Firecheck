@@ -2,7 +2,7 @@
     "device_mac": "AAABBBCCCDDD",
     "server_url": "http://127.0.0.1:5000",
     "camera_url": 0,
-    "model_path": "runs/detect/fire_detect_continue/weights/best.pt",
+    "model_path": "runs/detect/fire_detect/weights/best.pt",
     "use_npu": false,
     "rknn_model_path": "models/fire_yolov11.rknn",
     "conf_threshold": 0.35,
