@@ -104,16 +104,20 @@ class FlameDetector:
 
         logger.info(f"Loading YOLOv11 model: {resolved_path}")
         if self.cfg.use_npu and os.path.exists(self.cfg.rknn_model_path):
-            self._load_rknn_model()
+            self._load_rknn_model(resolved_path)
         elif os.path.exists(resolved_path):
             self.model = YOLO(resolved_path)
             self.cfg.model_path = resolved_path
         else:
             logger.warning(f"Fire model not found at {resolved_path}, downloading YOLOv11n base model")
             self.model = YOLO("yolo11n.pt")
-        logger.info("Model loaded")
+        
+        if hasattr(self, "model") and self.model is not None:
+            logger.info(f"Model loaded successfully. Classes detected: {self.model.names}")
+        else:
+            logger.info("Model loaded")
 
-    def _load_rknn_model(self):
+    def _load_rknn_model(self, resolved_path):
         try:
             from rknnlite.api import RKNNLite
             self.rknn = RKNNLite()
@@ -124,10 +128,10 @@ class FlameDetector:
             logger.info("RKNN model loaded on NPU")
         except ImportError:
             logger.warning("rknnlite not available, falling back to PyTorch")
-            self.model = YOLO(self.cfg.model_path) if os.path.exists(self.cfg.model_path) else YOLO("yolo11n.pt")
+            self.model = YOLO(resolved_path) if os.path.exists(resolved_path) else YOLO("yolo11n.pt")
         except Exception as e:
             logger.error(f"RKNN init failed: {e}, falling back to PyTorch")
-            self.model = YOLO(self.cfg.model_path) if os.path.exists(self.cfg.model_path) else YOLO("yolo11n.pt")
+            self.model = YOLO(resolved_path) if os.path.exists(resolved_path) else YOLO("yolo11n.pt")
 
     def open_camera(self):
         cam = self.cfg.camera_url
@@ -209,8 +213,17 @@ class FlameDetector:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"alarm_{ts}.mp4"
         filepath = os.path.join(self.cfg.save_dir, filename)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.video_writer = cv2.VideoWriter(filepath, fourcc, 20.0, (1280, 720))
+        
+        # Try avc1 first for HTML5 compatibility, fallback to mp4v if unavailable
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*"avc1")
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, 20.0, (1280, 720))
+            if not self.video_writer.isOpened():
+                raise Exception("avc1 writer not opened")
+        except Exception:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, 20.0, (1280, 720))
+            
         self.recording = True
         self.record_start_time = time.time()
         self._recorded_frames_filepath = filepath
@@ -227,6 +240,23 @@ class FlameDetector:
         self.recording = False
         elapsed = time.time() - self.record_start_time
         logger.info(f"Recording stopped, duration: {elapsed:.1f}s")
+        
+        # Transcode using ffmpeg if it's not HTML5 compatible or to guarantee playability
+        filepath = getattr(self, "_recorded_frames_filepath", "")
+        if filepath and os.path.exists(filepath):
+            temp_path = filepath + ".tmp.mp4"
+            try:
+                cmd = ["ffmpeg", "-y", "-i", filepath, "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3.0", temp_path]
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+                if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                    os.replace(temp_path, filepath)
+                    logger.info("Video transcoded successfully to H.264 via ffmpeg")
+            except Exception as e:
+                logger.warning(f"Video transcoding skipped or ffmpeg not available: {e}")
+                if os.path.exists(temp_path):
+                    try: os.remove(temp_path)
+                    except: pass
+                    
         return getattr(self, "_recorded_frames_filepath", ""), getattr(self, "_recorded_frames_filename", "")
 
     def send_alarm_to_server(self, image_path, image_filename, video_path, video_filename, detections):
@@ -413,8 +443,13 @@ class FlameDetector:
                 else:
                     ret, frame = self.cap.read()
                     if not ret:
-                        time.sleep(0.01)
-                        continue
+                        # For local video testing, reset frame pointer to 0 and loop
+                        if self.cap is not None:
+                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            ret, frame = self.cap.read()
+                        if not ret:
+                            time.sleep(0.01)
+                            continue
 
                 frame_count += 1
 

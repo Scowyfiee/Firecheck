@@ -239,6 +239,11 @@ CREATE TABLE IF NOT EXISTS T_UserLoginLog (
 );
 """)
     db.commit()
+    try:
+        db.execute("ALTER TABLE T_DetectResult ADD COLUMN Confidence REAL DEFAULT 0.0")
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
     db.close()
     seed_data()
 
@@ -402,8 +407,11 @@ def dashboard():
     month_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (month_ago,)).fetchone()["c"]
     year_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (year_ago,)).fetchone()["c"]
 
+    true_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='火灾已确认并报警'").fetchone()["c"]
+    false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
+
     recent_alarms = [dict(r) for r in db.execute(
-        "SELECT dr.*, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.CreatTime DESC LIMIT 30").fetchall()]
+        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.Status ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
 
     earliest_row = db.execute("SELECT MIN(CreatTime) as m FROM T_DetectResult").fetchone()
     earliest_time = earliest_row["m"] if earliest_row and earliest_row["m"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -412,14 +420,18 @@ def dashboard():
         "SELECT COALESCE(a.Name,'?') as name, COUNT(*) as count FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id WHERE dr.CreatTime > ? GROUP BY a.Id ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
     max_rank = max([r["count"] for r in monthly_ranking]) if monthly_ranking else 1
 
+    cameras = [dict(r) for r in db.execute("SELECT * FROM T_Camera ORDER BY Id").fetchall()]
+
     return render_template_string(DASHBOARD_TEMPLATE, user=user,
                                   total_alarms=total_alarms, pending_alarms=pending_alarms,
                                   total_devices=total_devices,
                                   today_count=today_count, week_count=week_count,
                                   month_count=month_count, year_count=year_count,
+                                  true_count=true_count, false_count=false_count,
                                   recent_alarms=recent_alarms,
                                   monthly_ranking=monthly_ranking, max_rank=max_rank,
-                                  earliest_time=earliest_time)
+                                  earliest_time=earliest_time,
+                                  cameras=cameras)
 
 
 # --- Routes: System Config ---
@@ -797,6 +809,21 @@ def alarm_process(aid):
     return redirect(url_for("alarm_list"))
 
 
+@app.route("/admin/alarm/clear_all", methods=["POST"])
+@login_required
+def admin_alarm_clear_all():
+    try:
+        db = get_db()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        db.execute("UPDATE T_DetectResult SET Status='2', OperateUserId=?, OperateTime=?, UrgencyDegree='普通', OperateResult='误报无需处理', Description='一键清空/批量处理' WHERE Status='1'", (session["user_id"],))
+        db.commit()
+        add_log("报警事件", "批量清空", {"operator_id": session["user_id"]})
+        return jsonify({"code": 200, "msg": "一键处理完成"})
+    except Exception as e:
+        logger.error(f"Clear all alarms error: {e}")
+        return jsonify({"code": 500, "msg": str(e)}), 500
+
+
 # --- Routes: Event Audit ---
 
 @app.route("/admin/audit")
@@ -949,12 +976,22 @@ def api_alarm():
             video_file.save(str(filepath))
             video_path = f"/uploads/videos/{filename}"
 
-        db.execute("""INSERT INTO T_DetectResult (Longitude, Latitude, Location, Picture, VideoUrl, AreaId, CreatTime, CameraId, DeviceId, Status)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        import json
+        detections_json = request.form.get("detections", "[]")
+        max_conf = 0.0
+        try:
+            detections = json.loads(detections_json)
+            if detections:
+                max_conf = max(float(d.get("confidence", 0.0)) for d in detections)
+        except Exception:
+            pass
+
+        db.execute("""INSERT INTO T_DetectResult (Longitude, Latitude, Location, Picture, VideoUrl, AreaId, CreatTime, CameraId, DeviceId, Status, Confidence)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                    (request.form.get("longitude", ""), request.form.get("latitude", ""),
                     request.form.get("location", ""), picture_path, video_path,
                     int(request.form.get("area_id", 1)), now,
-                    int(request.form.get("camera_id", 1)), int(request.form.get("device_id", 1)), "1"))
+                    int(request.form.get("camera_id", 1)), int(request.form.get("device_id", 1)), "1", max_conf))
         db.commit()
         aid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
         logger.info(f"Alarm received: id={aid}")
@@ -1006,7 +1043,10 @@ def api_stats():
     year_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (year_ago,)).fetchone()["c"]
 
     recent_alarms = [dict(r) for r in db.execute(
-        "SELECT dr.*, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.CreatTime DESC LIMIT 30").fetchall()]
+        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.Status ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
+
+    true_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='火灾已确认并报警'").fetchone()["c"]
+    false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
 
     earliest_row = db.execute("SELECT MIN(CreatTime) as m FROM T_DetectResult").fetchone()
     earliest_time = earliest_row["m"] if earliest_row and earliest_row["m"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1023,6 +1063,8 @@ def api_stats():
         "week_count": week_count,
         "month_count": month_count,
         "year_count": year_count,
+        "true_count": true_count,
+        "false_count": false_count,
         "pending_alarms": pending_alarms,
         "recent_alarms": recent_alarms,
         "monthly_ranking": monthly_ranking,
@@ -1203,42 +1245,28 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 """ + BASE_NAV + """
 <main class="flex-1 grid grid-cols-12 gap-5 p-5 h-[calc(100vh-56px)] overflow-hidden">
 <!-- Left Column: Search & Alarms Timeline -->
-<section class="col-span-3 flex flex-col gap-5 h-full overflow-hidden">
-  <!-- Search Panel -->
-  <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3">
-    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
-      <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
-      条件查询
-    </h2>
-    <div class="flex flex-col gap-2.5 text-[11px]">
-      <div class="flex flex-col gap-1">
-        <label class="text-slate-400 font-medium">地址查询</label>
-        <input type="text" id="searchLocation" placeholder="输入地址搜索..." class="w-full bg-slate-950/50 border border-slate-800/80 rounded-lg px-3 py-2 text-slate-200 placeholder-slate-650 focus:outline-none focus:border-cyan-500/50 transition">
+<section class="col-span-3 flex flex-col h-full overflow-hidden">
+  <!-- Alarm Timeline -->
+  <div class="flex-1 h-full glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 overflow-hidden border border-slate-800/80">
+    <div class="flex flex-col gap-2.5">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span class="w-1.5 h-3.5 bg-rose-500 rounded-full shadow-[0_0_8px_#f43f5e]"></span>
+          <span class="text-xs font-bold tracking-wider text-slate-200">报警记录</span>
+          <span class="text-rose-400 text-[10px] font-bold bg-rose-500/10 border border-rose-500/20 px-2.5 py-0.5 rounded-full" id="pendingAlarmsCount">{{ pending_alarms }}</span>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="clearAllAlarms()" class="text-[10px] bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-400 px-2 py-0.5 rounded-lg transition active:scale-95 font-semibold">一键处理</button>
+        </div>
       </div>
-      <div class="flex flex-col gap-1">
-        <label class="text-slate-400 font-medium">开始时间</label>
-        <input type="datetime-local" id="startTime" class="w-full bg-slate-950/50 border border-slate-800/80 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
-      </div>
-      <div class="flex flex-col gap-1">
-        <label class="text-slate-400 font-medium">结束时间</label>
-        <input type="datetime-local" id="endTime" class="w-full bg-slate-950/50 border border-slate-800/80 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
-      </div>
-      <div class="flex gap-2 mt-1">
-        <button onclick="handleSearch()" class="flex-1 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-400 py-2 rounded-lg font-semibold transition active:scale-95">查询</button>
-        <button onclick="resetSearch()" class="flex-1 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 text-slate-300 py-2 rounded-lg font-semibold transition active:scale-95">重置</button>
+      <!-- Inline Filters -->
+      <div class="grid grid-cols-12 gap-1.5 text-[9px]">
+        <input type="text" id="searchLocation" placeholder="位置搜索" class="col-span-4 bg-slate-950/50 border border-slate-800/80 rounded px-2 py-1 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-cyan-500/50 transition">
+        <input type="datetime-local" id="startTime" class="col-span-4 bg-slate-950/50 border border-slate-800/80 rounded px-1 py-1 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
+        <input type="datetime-local" id="endTime" class="col-span-4 bg-slate-950/50 border border-slate-800/80 rounded px-1 py-1 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
       </div>
     </div>
-  </div>
-  
-  <!-- Alarm Timeline -->
-  <div class="flex-1 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 overflow-hidden">
-    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center justify-between">
-      <div class="flex items-center gap-2">
-        <span class="w-1.5 h-3.5 bg-rose-500 rounded-full shadow-[0_0_8px_#f43f5e]"></span>
-        报警记录
-      </div>
-      <span class="text-rose-400 text-[10px] font-bold bg-rose-500/10 border border-rose-500/20 px-2.5 py-0.5 rounded-full" id="pendingAlarmsCount">{{ pending_alarms }}</span>
-    </h2>
+    
     <div class="flex-1 overflow-y-auto pr-1 flex flex-col gap-2 text-xs scrollbar-thin" id="timelineContainer">
       <div class="relative border-l border-slate-800 ml-2 pl-4 flex flex-col gap-3 py-2" id="timelineList">
         {% for a in recent_alarms %}
@@ -1248,10 +1276,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
           </span>
           <div class="bg-slate-950/25 border border-slate-800 rounded-xl p-3 flex flex-col gap-1 transition duration-200 cursor-pointer hover:border-cyan-500/40 hover:bg-slate-950/40" onclick="showAlarmDetail({{ a.Id }})">
             <div class="flex justify-between items-center">
-              <span class="text-rose-400 font-semibold text-[10px]">火焰预警</span>
+              <span class="text-rose-400 font-semibold text-[10px]">火焰预警 {% if a.Confidence %}({{ (a.Confidence*100)|round(1) }}%){% endif %}</span>
               <span class="text-slate-500 text-[9px] font-mono">{{ a.CreatTime or '--' }}</span>
             </div>
-            <span class="text-slate-300 text-xs truncate">{{ a.Location or a.AreaName or '未知位置' }}</span>
+            <div class="flex justify-between items-center text-[10px] text-slate-350">
+              <span class="truncate max-w-[120px]">{{ a.Location or a.AreaName or '未知位置' }}</span>
+              <span class="text-cyan-400 font-mono text-[9px] truncate max-w-[80px]">{{ a.CameraName or '摄像头1' }}</span>
+            </div>
           </div>
         </div>
         {% else %}
@@ -1271,7 +1302,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
         实时监控画面
       </h2>
-      <span class="text-[9px] text-slate-400 bg-slate-950/50 px-3 py-0.5 rounded-full border border-slate-800">1280x720 | WebSocket</span>
+      <div class="flex items-center gap-2">
+        <select id="cameraSelector" onchange="changeCameraStream()" class="bg-slate-950/50 border border-slate-800 rounded px-2 py-0.5 text-slate-300 focus:outline-none focus:border-cyan-500/50 transition text-[10px] font-semibold">
+          {% for c in cameras %}
+          <option value="{{ c.Id }}" data-port="{{ 9999 + loop.index0 }}">{{ c.Name }} (Port {{ 9999 + loop.index0 }})</option>
+          {% else %}
+          <option value="1" data-port="9999">默认相机 (Port 9999)</option>
+          {% endfor %}
+        </select>
+        <span class="text-[9px] text-slate-400 bg-slate-950/50 px-3 py-0.5 rounded-full border border-slate-800">1280x720 | WebSocket</span>
+      </div>
     </div>
     <div class="flex-1 bg-slate-950/60 rounded-xl relative overflow-hidden flex items-center justify-center tech-grid-diagonal border border-slate-900 shadow-inner">
       <img id="cameraFrame" class="hidden absolute inset-0 w-full h-full object-contain">
@@ -1281,21 +1321,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         </svg>
         <span class="text-slate-400 text-xs font-semibold tracking-wider">视频流未连接 (Camera Offline)</span>
       </div>
-      <span id="videoTag" class="hidden absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-450 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md">Offline</span>
+      <span id="videoTag" class="hidden absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-455 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md">Offline</span>
     </div>
   </div>
   
-  <!-- Bottom Section: Snapshots & Trend Chart -->
+  <!-- Bottom Section: Snapshots -->
   <div class="h-52 flex gap-5 shrink-0 overflow-hidden">
     <!-- Snapshots -->
-    <div class="w-1/2 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2.5 overflow-hidden border border-slate-800/80">
+    <div class="w-full glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2.5 overflow-hidden border border-slate-800/80">
       <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
         <span class="w-1.5 h-3.5 bg-orange-500 rounded-full shadow-[0_0_8px_#f97316]"></span>
         疑似火灾抓拍记录
       </h2>
       <div class="flex-1 flex gap-3 overflow-x-auto pb-1 scrollbar-thin" id="snapshotsContainer">
         {% set snapshots = recent_alarms|selectattr('Picture')|list %}
-        {% for a in snapshots[:4] %}
+        {% for a in snapshots[:8] %}
         <div class="w-40 shrink-0 rounded-xl bg-slate-950/40 border border-rose-500/35 p-1.5 flex flex-col gap-1 shadow-[0_0_10px_rgba(244,63,94,0.12)] hover:border-rose-500 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300 cursor-pointer" onclick="showAlarmDetail({{ a.Id }})">
           <div class="relative aspect-video rounded-lg overflow-hidden border border-rose-500/20">
             <img src="{{ a.Picture }}" class="w-full h-full object-cover">
@@ -1313,64 +1353,63 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         {% endfor %}
       </div>
     </div>
-    
-    <!-- Trend Chart -->
-    <div class="w-1/2 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 overflow-hidden border border-slate-800/80">
-      <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
-        <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
-        30天内预警趋势
-      </h2>
-      <div id="trendChart" class="flex-1 w-full h-full"></div>
-    </div>
   </div>
 </section>
 
-<!-- Right Column: Time, Statistics & Ranking / Area Distribution -->
-<section class="col-span-3 flex flex-col gap-5 h-full overflow-hidden">
+<!-- Right Column: Time, Statistics & Ranking / Trend Chart -->
+<section class="col-span-3 flex flex-col gap-4 h-full overflow-hidden">
   <!-- Clock & Date -->
-  <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 items-center text-center relative overflow-hidden shrink-0">
+  <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 items-center text-center relative overflow-hidden shrink-0 border border-slate-800/80">
     <div class="absolute -right-4 -top-4 w-16 h-16 bg-cyan-500/10 rounded-full blur-xl"></div>
     <div id="clock" class="text-3xl font-black tracking-widest text-cyan-300 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.4)]">--</div>
     <div class="text-[10px] text-slate-400 font-bold tracking-wider uppercase" id="liveDate">--</div>
   </div>
   
   <!-- Stats Box -->
-  <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 shrink-0">
+  <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 shrink-0 border border-slate-800/80">
     <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
       <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
       预警数据统计
     </h2>
-    <div class="grid grid-cols-2 gap-3 text-center">
-      <div class="bg-slate-950/50 border border-slate-850 rounded-xl p-3 flex flex-col gap-1 relative overflow-hidden group hover:border-cyan-500/40 hover:shadow-[0_0_15px_rgba(6,182,212,0.25)] transition duration-300">
-        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">⏰ 今日预警</span>
-        <span class="text-2xl font-black text-cyan-400 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.5)]" id="statToday">{{ today_count }}</span>
+    <div class="grid grid-cols-2 gap-2 text-center">
+      <div onclick="filterByTimeRange('today')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-cyan-500/40 hover:shadow-[0_0_15px_rgba(6,182,212,0.25)] transition duration-300">
+        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">⏰ 今日预警</span>
+        <span class="text-xl font-black text-cyan-400 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.5)]" id="statToday">{{ today_count }}</span>
         <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div class="bg-slate-950/50 border border-slate-850 rounded-xl p-3 flex flex-col gap-1 relative overflow-hidden group hover:border-orange-500/40 hover:shadow-[0_0_15px_rgba(249,115,22,0.25)] transition duration-300">
-        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">📅 本周预警</span>
-        <span class="text-2xl font-black text-orange-400 font-mono drop-shadow-[0_0_8px_rgba(249,115,22,0.5)]" id="statWeek">{{ week_count }}</span>
+      <div onclick="filterByTimeRange('week')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-orange-500/40 hover:shadow-[0_0_15px_rgba(249,115,22,0.25)] transition duration-300">
+        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">📅 本周预警</span>
+        <span class="text-xl font-black text-orange-400 font-mono drop-shadow-[0_0_8px_rgba(249,115,22,0.5)]" id="statWeek">{{ week_count }}</span>
         <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-orange-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div class="bg-slate-950/50 border border-slate-850 rounded-xl p-3 flex flex-col gap-1 relative overflow-hidden group hover:border-pink-500/40 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300">
-        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">📊 本月预警</span>
-        <span class="text-2xl font-black text-pink-400 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.5)]" id="statMonth">{{ month_count }}</span>
+      <div onclick="filterByTimeRange('month')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-pink-500/40 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300">
+        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">📊 本月预警</span>
+        <span class="text-xl font-black text-pink-400 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.5)]" id="statMonth">{{ month_count }}</span>
         <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-pink-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div class="bg-slate-950/50 border border-slate-850 rounded-xl p-3 flex flex-col gap-1 relative overflow-hidden group hover:border-emerald-500/40 hover:shadow-[0_0_15px_rgba(16,185,129,0.25)] transition duration-300">
-        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">✨ 本年预警</span>
-        <span class="text-2xl font-black text-emerald-400 font-mono drop-shadow-[0_0_8px_rgba(16,185,129,0.5)]" id="statYear">{{ year_count }}</span>
+      <div onclick="filterByTimeRange('year')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-emerald-500/40 hover:shadow-[0_0_15px_rgba(16,185,129,0.25)] transition duration-300">
+        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">✨ 本年预警</span>
+        <span class="text-xl font-black text-emerald-400 font-mono drop-shadow-[0_0_8px_rgba(16,185,129,0.5)]" id="statYear">{{ year_count }}</span>
         <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div class="bg-slate-950/50 border border-slate-850 rounded-xl p-3 flex flex-col gap-1 relative overflow-hidden group hover:border-blue-500/40 hover:shadow-[0_0_15px_rgba(59,130,246,0.25)] transition duration-300 col-span-2">
-        <div class="flex justify-between items-center px-2">
-          <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center gap-1">📈 累计预警</span>
-          <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center gap-1">🚨 待处理预警</span>
-        </div>
-        <div class="flex justify-between items-center px-4 mt-0.5">
-          <span class="text-2xl font-black text-blue-400 font-mono drop-shadow-[0_0_8px_rgba(59,130,246,0.5)]" id="statTotal">{{ total_alarms }}</span>
-          <span class="text-2xl font-black text-rose-500 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.5)] animate-pulse" id="statPending">{{ pending_alarms }}</span>
-        </div>
+      
+      <!-- Split bottom row -->
+      <div onclick="filterByTimeRange('all')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-blue-500/40 hover:shadow-[0_0_15px_rgba(59,130,246,0.25)] transition duration-300">
+        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">📈 累计预警</span>
+        <span class="text-xl font-black text-blue-400 font-mono drop-shadow-[0_0_8px_rgba(59,130,246,0.5)]" id="statTotal">{{ total_alarms }}</span>
         <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      </div>
+      <div onclick="filterByTimeRange('pending')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-rose-500/40 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300">
+        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">🚨 待处理预警</span>
+        <span class="text-xl font-black text-rose-500 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.5)] animate-pulse" id="statPending">{{ pending_alarms }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-rose-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      </div>
+      
+      <!-- Real vs False Alarms Summary -->
+      <div class="col-span-2 bg-slate-950/30 border border-slate-900 rounded-xl p-1.5 text-[9px] text-slate-450 flex items-center justify-around">
+        <span>🔥 确认火警: <strong class="text-rose-400 font-bold" id="statTrueCount">{{ true_count }}</strong> 次</span>
+        <span class="text-slate-800">|</span>
+        <span>排除误报: <strong class="text-emerald-400 font-bold" id="statFalseCount">{{ false_count }}</strong> 次</span>
       </div>
     </div>
   </div>
@@ -1385,9 +1424,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     </div>
     
     <div class="flex-1 overflow-y-auto scrollbar-thin pr-1">
-      <div class="flex flex-col gap-3.5 justify-center py-1" id="rankingList">
+      <div class="flex flex-col gap-3 justify-center py-1" id="rankingList">
         {% for item in monthly_ranking %}
-        <div class="flex flex-col gap-1.5">
+        <div onclick="filterByLocation('{{ item.name }}')" class="cursor-pointer flex flex-col gap-1.5 p-1 rounded hover:bg-slate-950/40 transition">
           <div class="flex justify-between text-[11px] font-medium">
             <span class="text-slate-300">{{ item.name }}</span>
             <span class="text-amber-400 font-semibold">{{ item.count }} 次</span>
@@ -1397,10 +1436,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
         {% else %}
-        <div class="flex items-center justify-center h-full text-slate-655 text-xs">暂无数据</div>
+        <div class="flex items-center justify-center h-full text-slate-600 text-xs">暂无数据</div>
         {% endfor %}
       </div>
     </div>
+  </div>
+
+  <!-- Trend Chart -->
+  <div class="h-48 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 overflow-hidden border border-slate-800/80 shrink-0">
+    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
+      <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
+      30天内预警趋势
+    </h2>
+    <div id="trendChart" class="flex-1 w-full h-full"></div>
   </div>
 </section>
 </main>
@@ -1418,11 +1466,16 @@ setInterval(upd,1000);
 // WebSocket connection for live camera stream
 var ws=null,wsReconnectTimer=null,wsReconnectDelay=1000;
 function wsConnect(){
+  if(wsReconnectTimer){clearTimeout(wsReconnectTimer); wsReconnectTimer=null;}
   if(ws){try{ws.close();}catch(e){}}
   
-  // Try to use current hostname first
   const host = location.hostname || '127.0.0.1';
-  const wsUrl = 'ws://' + host + ':9999';
+  let port = '9999';
+  const selector = document.getElementById('cameraSelector');
+  if(selector && selector.selectedIndex >= 0) {
+    port = selector.options[selector.selectedIndex].getAttribute('data-port') || '9999';
+  }
+  const wsUrl = 'ws://' + host + ':' + port;
   
   console.log('[WS] Connecting to: ' + wsUrl);
   ws=new WebSocket(wsUrl);
@@ -1435,7 +1488,7 @@ function wsConnect(){
     var t=document.getElementById('videoTag');
     t.classList.remove('hidden');
     t.textContent='Live';
-    t.className='absolute top-3 left-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-450 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
+    t.className='absolute top-3 left-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
     wsReconnectDelay=1000;
   };
   
@@ -1453,7 +1506,7 @@ function wsConnect(){
     var t=document.getElementById('videoTag');
     t.classList.remove('hidden');
     t.textContent='Offline';
-    t.className='absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-450 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
+    t.className='absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-455 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
     
     wsReconnectTimer=setTimeout(wsConnect, wsReconnectDelay);
     wsReconnectDelay=Math.min(wsReconnectDelay*2, 10000);
@@ -1463,12 +1516,17 @@ function wsConnect(){
     console.error('[WS] Error observed:', e);
   };
 }
+function changeCameraStream(){
+  wsReconnectDelay=1000;
+  wsConnect();
+}
 wsConnect();
 
-// Search / Query functionality
+// Search / Query & Interactive Filtering functionality
 var filterLocation = '';
 var filterStart = '';
 var filterEnd = '';
+var filterStatus = ''; // '' for all, '1' for pending
 
 var earliestAlarmTime = "{{ earliest_time }}";
 function formatDateTimeLocal(dateStr) {
@@ -1481,35 +1539,104 @@ function getNowDateTimeLocal() {
   return (new Date(now - tzOffset)).toISOString().slice(0, 16);
 }
 
-// Set initial datetime picker values on load
+// Bind event listeners for inline filtering on load
 document.addEventListener("DOMContentLoaded", function() {
   const startInput = document.getElementById('startTime');
   const endInput = document.getElementById('endTime');
-  if (startInput) startInput.value = formatDateTimeLocal(earliestAlarmTime);
-  if (endInput) endInput.value = getNowDateTimeLocal();
+  const locInput = document.getElementById('searchLocation');
+  
+  if (startInput) {
+    startInput.value = formatDateTimeLocal(earliestAlarmTime);
+    filterStart = startInput.value;
+    startInput.addEventListener('change', function() {
+      filterStart = this.value;
+      fetchRealtimeData();
+    });
+  }
+  if (endInput) {
+    endInput.value = getNowDateTimeLocal();
+    filterEnd = endInput.value;
+    endInput.addEventListener('change', function() {
+      filterEnd = this.value;
+      fetchRealtimeData();
+    });
+  }
+  if (locInput) {
+    locInput.addEventListener('input', function() {
+      filterLocation = this.value.trim().toLowerCase();
+      fetchRealtimeData();
+    });
+  }
 });
 
-function handleSearch() {
-  filterLocation = document.getElementById('searchLocation').value.trim().toLowerCase();
-  filterStart = document.getElementById('startTime').value;
-  filterEnd = document.getElementById('endTime').value;
+function filterByTimeRange(range) {
+  const startInput = document.getElementById('startTime');
+  const endInput = document.getElementById('endTime');
+  const locInput = document.getElementById('searchLocation');
+  
+  filterStatus = ''; // reset status by default
+  const now = new Date();
+  
+  if (range === 'today') {
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    if (startInput) startInput.value = formatDateTimeLocal(todayStart.toISOString());
+    if (endInput) endInput.value = getNowDateTimeLocal();
+  } else if (range === 'week') {
+    const weekStart = new Date(now.getTime() - 7 * 24 * 3600 * 1000);
+    if (startInput) startInput.value = formatDateTimeLocal(weekStart.toISOString());
+    if (endInput) endInput.value = getNowDateTimeLocal();
+  } else if (range === 'month') {
+    const monthStart = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+    if (startInput) startInput.value = formatDateTimeLocal(monthStart.toISOString());
+    if (endInput) endInput.value = getNowDateTimeLocal();
+  } else if (range === 'year') {
+    const yearStart = new Date(now.getFullYear(), 0, 1);
+    if (startInput) startInput.value = formatDateTimeLocal(yearStart.toISOString());
+    if (endInput) endInput.value = getNowDateTimeLocal();
+  } else if (range === 'pending') {
+    filterStatus = '1';
+    if (startInput) startInput.value = '';
+    if (endInput) endInput.value = '';
+  } else if (range === 'all') {
+    if (startInput) startInput.value = '';
+    if (endInput) endInput.value = '';
+    if (locInput) locInput.value = '';
+    filterLocation = '';
+  }
+  
+  filterStart = startInput ? startInput.value : '';
+  filterEnd = endInput ? endInput.value : '';
   fetchRealtimeData();
 }
 
-function resetSearch() {
-  document.getElementById('searchLocation').value = '';
-  const startInput = document.getElementById('startTime');
-  const endInput = document.getElementById('endTime');
-  if (startInput) startInput.value = formatDateTimeLocal(earliestAlarmTime);
-  if (endInput) endInput.value = getNowDateTimeLocal();
-  filterLocation = '';
-  filterStart = '';
-  filterEnd = '';
-  fetchRealtimeData();
+function filterByLocation(loc) {
+  const locInput = document.getElementById('searchLocation');
+  if (locInput) {
+    locInput.value = loc;
+    filterLocation = loc.toLowerCase();
+    fetchRealtimeData();
+  }
+}
+
+function clearAllAlarms() {
+  if (!confirm('是否将所有未处理报警标记为“误报无需处理”？')) return;
+  fetch('/admin/alarm/clear_all', { method: 'POST' })
+    .then(res => res.json())
+    .then(data => {
+      if (data.code === 200) {
+        alert('所有未处理报警已一键处理为误报！');
+        fetchRealtimeData();
+      } else {
+        alert('处理失败: ' + data.msg);
+      }
+    })
+    .catch(err => {
+      console.error(err);
+      alert('网络请求失败');
+    });
 }
 
 var trendChartInstance = null;
-var pieChartInstance = null;
 
 // ECharts Themes & Configurations
 const chartTextColor = '#94a3b8';
@@ -1709,6 +1836,11 @@ function fetchRealtimeData() {
       
       const pendingBadge = document.getElementById('pendingAlarmsCount');
       if (pendingBadge) pendingBadge.textContent = data.pending_alarms;
+      
+      const trueCountEl = document.getElementById('statTrueCount');
+      if (trueCountEl) trueCountEl.textContent = data.true_count;
+      const falseCountEl = document.getElementById('statFalseCount');
+      if (falseCountEl) falseCountEl.textContent = data.false_count;
 
       // Update global alarmData mapping dynamically
       (data.recent_alarms || []).forEach(a => {
@@ -1729,6 +1861,9 @@ function fetchRealtimeData() {
 
       // Filter recent alarms locally based on query conditions
       let filteredAlarms = data.recent_alarms || [];
+      if (filterStatus) {
+        filteredAlarms = filteredAlarms.filter(a => a.Status === filterStatus);
+      }
       if (filterLocation) {
         filteredAlarms = filteredAlarms.filter(a => {
           const loc = (a.Location || a.AreaName || '').toLowerCase();
@@ -1756,12 +1891,14 @@ function fetchRealtimeData() {
       const timelineList = document.getElementById('timelineList');
       if (timelineList) {
         if (filteredAlarms.length === 0) {
-          timelineList.innerHTML = '<div class="text-slate-655 text-center py-8">暂无报警记录</div>';
+          timelineList.innerHTML = '<div class="text-slate-600 text-center py-8">暂无报警记录</div>';
         } else {
           let timelineHtml = '';
           filteredAlarms.forEach(a => {
             const location = a.Location || a.AreaName || '未知位置';
             const timeStr = a.CreatTime || '--';
+            const camera = a.CameraName || '摄像头1';
+            const confBadge = a.Confidence ? '(' + (a.Confidence * 100).toFixed(1) + '%)' : '';
             
             timelineHtml += `
             <div class="relative mb-2">
@@ -1770,10 +1907,13 @@ function fetchRealtimeData() {
               </span>
               <div class="bg-slate-950/25 border border-slate-800 rounded-xl p-3 flex flex-col gap-1 transition duration-200 cursor-pointer hover:border-cyan-500/40 hover:bg-slate-950/40" onclick="showAlarmDetail(${a.Id})">
                 <div class="flex justify-between items-center">
-                  <span class="text-rose-400 font-semibold text-[10px]">火焰预警</span>
+                  <span class="text-rose-400 font-semibold text-[10px]">火焰预警 ${confBadge}</span>
                   <span class="text-slate-500 text-[9px] font-mono">${timeStr}</span>
                 </div>
-                <span class="text-slate-300 text-xs truncate">${location}</span>
+                <div class="flex justify-between items-center text-[10px] text-slate-350">
+                  <span class="truncate max-w-[120px]">${location}</span>
+                  <span class="text-cyan-400 font-mono text-[9px] truncate max-w-[80px]">${camera}</span>
+                </div>
               </div>
             </div>`;
           });
@@ -1786,10 +1926,10 @@ function fetchRealtimeData() {
       if (snapshotsContainer) {
         const snapshots = (data.recent_alarms || []).filter(a => a.Picture);
         if (snapshots.length === 0) {
-          snapshotsContainer.innerHTML = '<div class="flex items-center justify-center w-full text-slate-655 text-xs py-8">暂无抓拍记录</div>';
+          snapshotsContainer.innerHTML = '<div class="flex items-center justify-center w-full text-slate-600 text-xs py-8">暂无抓拍记录</div>';
         } else {
           let snapshotsHtml = '';
-          snapshots.slice(0, 4).forEach(a => {
+          snapshots.slice(0, 8).forEach(a => {
             const location = a.Location || '--';
             const timeStr = a.CreatTime ? a.CreatTime.substring(11, 19) : '--';
             snapshotsHtml += `
@@ -1814,14 +1954,14 @@ function fetchRealtimeData() {
       const rankingList = document.getElementById('rankingList');
       if (rankingList && data.monthly_ranking) {
         if (data.monthly_ranking.length === 0) {
-          rankingList.innerHTML = '<div class="flex items-center justify-center h-full text-slate-655 text-xs">暂无数据</div>';
+          rankingList.innerHTML = '<div class="flex items-center justify-center h-full text-slate-600 text-xs">暂无数据</div>';
         } else {
           let rankingHtml = '';
           const maxRank = data.max_rank || 1;
           data.monthly_ranking.forEach(item => {
             const percentage = Math.round((item.count / maxRank) * 100);
             rankingHtml += `
-            <div class="flex flex-col gap-1.5">
+            <div onclick="filterByLocation('${item.name}')" class="cursor-pointer flex flex-col gap-1.5 p-1 rounded hover:bg-slate-950/40 transition">
               <div class="flex justify-between text-[11px] font-medium">
                 <span class="text-slate-300">${item.name}</span>
                 <span class="text-amber-400 font-semibold">${item.count} 次</span>
@@ -3139,6 +3279,7 @@ ALARM_TEMPLATE = make_admin_template("报警事件", """
           <th class="px-4 py-3">关联摄像头</th>
           <th class="px-4 py-3">报警时间</th>
           <th class="px-4 py-3">报警状态</th>
+          <th class="px-4 py-3">处理结果</th>
           <th class="px-4 py-3">处理人</th>
           <th class="px-4 py-3">操作</th>
         </tr>
@@ -3168,6 +3309,7 @@ ALARM_TEMPLATE = make_admin_template("报警事件", """
             <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-semibold">已审核</span>
             {% endif %}
           </td>
+          <td class="px-4 py-3 text-slate-300 alarm-result">{{ a.OperateResult or '--' }}</td>
           <td class="px-4 py-3 text-slate-400">{{ a.OperatorName or '--' }}</td>
           <td class="px-4 py-3 flex items-center gap-2">
             <button class="bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/20 text-cyan-400 px-2.5 py-1 rounded-md font-medium transition active:scale-95" onclick="showAlarmDetail({{ a.Id }})">详情</button>
@@ -3178,7 +3320,7 @@ ALARM_TEMPLATE = make_admin_template("报警事件", """
         </tr>
         {% else %}
         <tr>
-          <td colspan="8" class="px-4 py-8 text-center text-slate-500">暂无报警事件数据</td>
+          <td colspan="9" class="px-4 py-8 text-center text-slate-500">暂无报警事件数据</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -3324,85 +3466,111 @@ const alarmData = {
     videoUrl: "{{ a.VideoUrl or '' }}",
     status: "{{ a.Status }}",
     desc: "{{ (a.Description or '')|replace('\\\\', '\\\\\\\\')|replace('"', '\\"')|replace('\r', '')|replace('\n', '\\n') }}",
-    urgency: "{{ a.UrgencyDegree or '' }}",
-    result: "{{ a.OperateResult or '' }}",
-    operator: "{{ a.OperatorName or '' }}",
-    operateTime: "{{ a.OperateTime or '' }}"
+    urgency: "{{ a.UrgencyDegree if a.UrgencyDegree is not none else '' }}",
+    result: "{{ a.OperateResult if a.OperateResult is not none else '' }}",
+    operator: "{{ a.OperatorName if a.OperatorName is not none else '' }}",
+    operateTime: "{{ a.OperateTime if a.OperateTime is not none else '' }}"
   },
   {% endfor %}
 };
 
 function showAlarmDetail(id) {
-  const a = alarmData[id];
-  if (!a) return;
+  try {
+    const a = alarmData[id];
+    if (!a) return;
 
-  document.getElementById('modalProcessForm').action = '/admin/alarm/process/' + id;
-  document.getElementById('modalAlarmTime').textContent = a.time || '--';
-  document.getElementById('modalAlarmLocation').textContent = a.location || '未知位置';
-  
-  // Picture
-  const img = document.getElementById('modalAlarmImage');
-  const noImg = document.getElementById('modalAlarmNoImage');
-  if (a.picture) {
-    img.src = a.picture;
-    img.classList.remove('hidden');
-    noImg.classList.add('hidden');
-  } else {
-    img.src = '';
-    img.classList.add('hidden');
-    noImg.classList.remove('hidden');
-  }
-  
-  // Video
-  const video = document.getElementById('modalAlarmVideo');
-  const noVideo = document.getElementById('modalAlarmNoVideo');
-  if (a.videoUrl) {
-    video.src = a.videoUrl;
-    video.classList.remove('hidden');
-    noVideo.classList.add('hidden');
-  } else {
-    video.src = '';
-    video.classList.add('hidden');
-    noVideo.classList.remove('hidden');
-  }
-
-  const statusEl = document.getElementById('modalAlarmStatus');
-  if (a.status === '1') {
-    statusEl.textContent = '报警 (未处理)';
-    statusEl.className = 'text-rose-450 font-bold';
-    document.getElementById('modalProcessForm').classList.remove('hidden');
-    document.getElementById('modalProcessedInfo').classList.add('hidden');
-  } else {
-    const statusText = a.status === '2' ? '待审核' : '已审核';
-    statusEl.textContent = statusText;
-    statusEl.className = a.status === '2' ? 'text-amber-450 font-bold' : 'text-emerald-450 font-bold';
+    const formEl = document.getElementById('modalProcessForm');
+    if (formEl) formEl.action = '/admin/alarm/process/' + id;
     
-    document.getElementById('modalProcessForm').classList.add('hidden');
-    document.getElementById('modalProcessedInfo').classList.remove('hidden');
+    const timeEl = document.getElementById('modalAlarmTime');
+    if (timeEl) timeEl.textContent = a.time || '--';
     
-    document.getElementById('modalInfoOperator').textContent = a.operator || '系统/未知';
-    document.getElementById('modalInfoTime').textContent = a.operateTime || '--';
-    document.getElementById('modalInfoResult').textContent = a.result || '--';
-    document.getElementById('modalInfoUrgency').textContent = a.urgency || '普通';
-    document.getElementById('modalInfoDesc').textContent = a.desc || '无备注';
+    const locEl = document.getElementById('modalAlarmLocation');
+    if (locEl) locEl.textContent = a.location || '未知位置';
     
-    const auditActions = document.getElementById('modalAuditActions');
-    if (auditActions) {
-      if (a.status === '2') {
-        auditActions.classList.remove('hidden');
-        document.getElementById('modalAuditApproveBtn').href = '/admin/audit/approve/' + id;
-        document.getElementById('modalAuditRejectBtn').href = '/admin/audit/reject/' + id;
+    // Picture
+    const img = document.getElementById('modalAlarmImage');
+    const noImg = document.getElementById('modalAlarmNoImage');
+    if (img && noImg) {
+      if (a.picture) {
+        img.src = a.picture;
+        img.classList.remove('hidden');
+        noImg.classList.add('hidden');
       } else {
-        auditActions.classList.add('hidden');
+        img.src = '';
+        img.classList.add('hidden');
+        noImg.classList.remove('hidden');
       }
     }
-  }
+    
+    // Video
+    const video = document.getElementById('modalAlarmVideo');
+    const noVideo = document.getElementById('modalAlarmNoVideo');
+    if (video && noVideo) {
+      if (a.videoUrl) {
+        video.src = a.videoUrl;
+        video.classList.remove('hidden');
+        noVideo.classList.add('hidden');
+      } else {
+        video.src = '';
+        video.classList.add('hidden');
+        noVideo.classList.remove('hidden');
+      }
+    }
 
-  document.getElementById('detailModal').classList.remove('hidden');
+    const statusEl = document.getElementById('modalAlarmStatus');
+    if (statusEl) {
+      if (a.status === '1') {
+        statusEl.textContent = '报警 (未处理)';
+        statusEl.className = 'text-rose-450 font-bold';
+        if (formEl) formEl.classList.remove('hidden');
+        const pInfo = document.getElementById('modalProcessedInfo');
+        if (pInfo) pInfo.classList.add('hidden');
+      } else {
+        const statusText = a.status === '2' ? '待审核' : '已审核';
+        statusEl.textContent = statusText;
+        statusEl.className = a.status === '2' ? 'text-amber-450 font-bold' : 'text-emerald-450 font-bold';
+        
+        if (formEl) formEl.classList.add('hidden');
+        const pInfo = document.getElementById('modalProcessedInfo');
+        if (pInfo) pInfo.classList.remove('hidden');
+        
+        const opEl = document.getElementById('modalInfoOperator');
+        if (opEl) opEl.textContent = a.operator || '系统/未知';
+        const opTimeEl = document.getElementById('modalInfoTime');
+        if (opTimeEl) opTimeEl.textContent = a.operateTime || '--';
+        const opResEl = document.getElementById('modalInfoResult');
+        if (opResEl) opResEl.textContent = a.result || '--';
+        const opUrgEl = document.getElementById('modalInfoUrgency');
+        if (opUrgEl) opUrgEl.textContent = a.urgency || '普通';
+        const opDescEl = document.getElementById('modalInfoDesc');
+        if (opDescEl) opDescEl.textContent = a.desc || '无备注';
+        
+        const auditActions = document.getElementById('modalAuditActions');
+        if (auditActions) {
+          if (a.status === '2') {
+            auditActions.classList.remove('hidden');
+            const appBtn = document.getElementById('modalAuditApproveBtn');
+            if (appBtn) appBtn.href = '/admin/audit/approve/' + id;
+            const rejBtn = document.getElementById('modalAuditRejectBtn');
+            if (rejBtn) rejBtn.href = '/admin/audit/reject/' + id;
+          } else {
+            auditActions.classList.add('hidden');
+          }
+        }
+      }
+    }
+
+    const modal = document.getElementById('detailModal');
+    if (modal) modal.classList.remove('hidden');
+  } catch (err) {
+    console.error('showAlarmDetail error:', err);
+  }
 }
 
 function closeAlarmDetail() {
-  document.getElementById('detailModal').classList.add('hidden');
+  const modal = document.getElementById('detailModal');
+  if (modal) modal.classList.add('hidden');
   const video = document.getElementById('modalAlarmVideo');
   if (video) {
     video.pause();
