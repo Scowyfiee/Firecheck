@@ -95,13 +95,21 @@ class FlameDetector:
         self._frame_lock = threading.Lock()
 
     def load_model(self):
-        logger.info(f"Loading YOLOv11 model: {self.cfg.model_path}")
+        model_path = self.cfg.model_path
+        if not os.path.isabs(model_path):
+            board_dir = os.path.dirname(os.path.abspath(__file__))
+            resolved_path = os.path.abspath(os.path.join(board_dir, model_path))
+        else:
+            resolved_path = model_path
+
+        logger.info(f"Loading YOLOv11 model: {resolved_path}")
         if self.cfg.use_npu and os.path.exists(self.cfg.rknn_model_path):
             self._load_rknn_model()
-        elif os.path.exists(self.cfg.model_path):
-            self.model = YOLO(self.cfg.model_path)
+        elif os.path.exists(resolved_path):
+            self.model = YOLO(resolved_path)
+            self.cfg.model_path = resolved_path
         else:
-            logger.warning("Fire model not found, downloading YOLOv11n base model")
+            logger.warning(f"Fire model not found at {resolved_path}, downloading YOLOv11n base model")
             self.model = YOLO("yolo11n.pt")
         logger.info("Model loaded")
 
@@ -123,17 +131,24 @@ class FlameDetector:
 
     def open_camera(self):
         cam = self.cfg.camera_url
-        if isinstance(cam, int) or cam.isdigit():
-            self.cap = cv2.VideoCapture(int(cam))
-        else:
-            self.cap = cv2.VideoCapture(cam)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera: {cam}")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 25)
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
-        logger.info(f"Camera opened, FPS: {self.fps}")
+        try:
+            if isinstance(cam, int) or (isinstance(cam, str) and cam.isdigit()):
+                self.cap = cv2.VideoCapture(int(cam))
+            else:
+                self.cap = cv2.VideoCapture(cam)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Cannot open camera: {cam}")
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.cap.set(cv2.CAP_PROP_FPS, 25)
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+            self.is_mock = False
+            logger.info(f"Camera opened, FPS: {self.fps}")
+        except Exception as e:
+            logger.warning(f"Failed to open camera ({cam}): {e}. Falling back to mock camera stream simulation.")
+            self.cap = None
+            self.is_mock = True
+            self.fps = 25
 
     def detect_frame(self, frame):
         if self.cfg.use_npu and hasattr(self, "rknn"):
@@ -320,31 +335,38 @@ class FlameDetector:
             self.register_device()
             time.sleep(self.cfg.heartbeat_interval)
 
-    def _websocket_server(self, port=8080):
+    def _websocket_server(self, port=9999):
         import asyncio
+        import websockets
 
         async def handler(ws):
-            while self.running:
-                with self._frame_lock:
-                    f = self._latest_frame.copy() if self._latest_frame is not None else None
-                if f is not None:
-                    _, jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                    try:
+            logger.info(f"[WS] New connection from {ws.remote_address}")
+            try:
+                while self.running:
+                    with self._frame_lock:
+                        f = self._latest_frame.copy() if self._latest_frame is not None else None
+                    
+                    if f is not None:
+                        _, jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 50])
                         await ws.send(jpg.tobytes())
-                    except Exception:
-                        break
-                await asyncio.sleep(0.033)
+                    
+                    await asyncio.sleep(0.04)
+            except websockets.exceptions.ConnectionClosed:
+                logger.info(f"[WS] Connection closed: {ws.remote_address}")
+            except Exception as e:
+                logger.error(f"[WS] Handler error: {e}")
 
         async def serve():
-            async with websockets.serve(handler, "0.0.0.0", port, ping_interval=None):
-                await asyncio.Future()
+            try:
+                async with websockets.serve(handler, "0.0.0.0", port, ping_interval=20, ping_timeout=20):
+                    logger.info(f"[WS] Server successfully bound to port {port}")
+                    await asyncio.Future() # Keep alive forever
+            except Exception as e:
+                logger.error(f"[WS] Server failed to start: {e}")
 
-        def run_loop():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(serve())
-
-        threading.Thread(target=run_loop, daemon=True).start()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(serve())
 
     def set_latest_frame(self, frame):
         with self._frame_lock:
@@ -355,27 +377,55 @@ class FlameDetector:
         self.open_camera()
         self.register_device()
 
-        heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
         self.running = True
-        heartbeat_thread.start()
-        threading.Thread(target=self._websocket_server, args=(8080,), daemon=True).start()
+        
+        # Start Heartbeat
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        
+        # Start WebSocket Server
+        threading.Thread(target=self._websocket_server, args=(9999,), daemon=True).start()
 
-        logger.info("Flame detection started, WebSocket: ws://0.0.0.0:8080")
+        logger.info("Flame detection started. Main loop running.")
         frame_count = 0
         last_print = 0
 
         try:
             while self.running:
-                ret, frame = self.cap.read()
-                if not ret:
-                    time.sleep(0.01)
-                    continue
+                if getattr(self, "is_mock", False):
+                    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+                    for x in range(0, 1280, 80):
+                        cv2.line(frame, (x, 0), (x, 720), (15, 23, 42), 1)
+                    for y in range(0, 720, 80):
+                        cv2.line(frame, (0, y), (1280, y), (15, 23, 42), 1)
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    cv2.putText(frame, "CAMERA SIMULATION ACTIVE", (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (6, 182, 212), 2)
+                    cv2.putText(frame, f"TIMESTAMP: {ts}", (40, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (148, 163, 184), 1)
+                    cv2.putText(frame, f"LOCATION: {self.cfg.location}", (40, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (148, 163, 184), 1)
+                    
+                    angle = (time.time() * 2) % (2 * np.pi)
+                    cx = int(640 + 200 * np.cos(angle))
+                    cy = int(360 + 100 * np.sin(angle))
+                    cv2.circle(frame, (cx, cy), 15, (16, 185, 129), -1)
+                    cv2.putText(frame, "SIMULATED TARGET", (cx - 60, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (16, 185, 129), 1)
+                    
+                    ret = True
+                    time.sleep(1.0 / self.fps)
+                else:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        time.sleep(0.01)
+                        continue
 
                 frame_count += 1
 
-                result = self.detect_frame(frame)
+                if getattr(self, "is_mock", False):
+                    result = None
+                    detections = []
+                else:
+                    result = self.detect_frame(frame)
+                    detections = self.get_detection_info(result, frame.shape) if result else []
+                
                 annotated = frame.copy()
-                detections = self.get_detection_info(result, frame.shape) if result else []
 
                 for det in detections:
                     x1, y1, x2, y2 = det["bbox"]
@@ -390,7 +440,12 @@ class FlameDetector:
                         for det in detections:
                             print(f"  🔥 {det['class_name']} conf={det['confidence']:.2f}")
                         last_print = time.time()
-                    self.process_alarm(frame, result)
+                    if not self.recording:
+                        threading.Thread(
+                            target=self.process_alarm,
+                            args=(frame.copy(), result),
+                            daemon=True
+                        ).start()
 
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
