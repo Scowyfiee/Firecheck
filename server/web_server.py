@@ -4,6 +4,7 @@
 Flask + SQLite + Bootstrap + ECharts 数据大屏
 """
 
+# --- 标准库导入 ---
 import os
 import sys
 import json
@@ -17,65 +18,84 @@ from datetime import datetime, timedelta
 from functools import wraps
 from io import BytesIO
 
+# --- Flask 框架及相关工具导入 ---
 from flask import (
     Flask, render_template_string, request, redirect, url_for,
     session, jsonify, send_from_directory, g, flash, make_response
 )
 
+# 配置日志：INFO 级别，带时间戳和级别标签
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WebServer")
 
+# 基础路径与数据库路径
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "flame_system.db"
+# 上传文件目录，递归创建 pictures / videos / logo 子目录
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 (UPLOAD_DIR / "pictures").mkdir(exist_ok=True)
 (UPLOAD_DIR / "videos").mkdir(exist_ok=True)
 (UPLOAD_DIR / "logo").mkdir(exist_ok=True)
 
+# 创建 Flask 应用实例，使用随机生成的密钥用于 session 加密
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 
 
 def get_db():
+    """获取/创建当前请求的 SQLite 数据库连接，缓存在 Flask g 对象中。
+    
+    Returns:
+        sqlite3.Connection: 数据库连接对象（row_factory 为 sqlite3.Row，启用 WAL 模式和外键约束）
+    """
     if "db" not in g:
         g.db = sqlite3.connect(str(DB_PATH))
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
-        g.db.execute("PRAGMA foreign_keys=ON")
+        g.db.row_factory = sqlite3.Row  # 允许通过列名访问查询结果
+        g.db.execute("PRAGMA journal_mode=WAL")  # 启用 Write-Ahead Logging，提高并发性能
+        g.db.execute("PRAGMA foreign_keys=ON")    # 强制外键约束检查
     return g.db
 
 
 @app.teardown_appcontext
 def close_db(exception):
+    """应用上下文销毁时自动关闭数据库连接，防止连接泄漏。
+    
+    Args:
+        exception: Flask 传递的异常对象（正常请求时为空）
+    """
     db = g.pop("db", None)
     if db:
         db.close()
 
 
 def init_db():
+    """初始化数据库：创建所有业务表结构并执行字段兼容性迁移，最后调用 seed_data 填充初始数据。"""
     db = sqlite3.connect(str(DB_PATH))
     db.executescript("""
+-- 系统配置表：存储站点名称、检测阈值、心跳间隔等全局参数
 CREATE TABLE IF NOT EXISTS T_Site (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Name TEXT DEFAULT '视频AI智能识别及预警管理系统',
     SiteName TEXT DEFAULT '火焰预警平台',
     Logo TEXT,
-    thresh REAL DEFAULT 0.35,
-    width REAL DEFAULT 640,
-    height REAL DEFAULT 480,
-    video_times REAL DEFAULT 5,
-    heartBeat REAL DEFAULT 1,
-    exception_times REAL DEFAULT 5
+    thresh REAL DEFAULT 0.35,          -- 火焰检测置信度阈值
+    width REAL DEFAULT 640,            -- 视频帧宽度
+    height REAL DEFAULT 480,           -- 视频帧高度
+    video_times REAL DEFAULT 5,        -- 录像时长（秒）
+    heartBeat REAL DEFAULT 1,          -- 心跳间隔（分钟）
+    exception_times REAL DEFAULT 5     -- 异常报警触发次数
 );
 
+-- 角色表
 CREATE TABLE IF NOT EXISTS T_Role (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Name TEXT NOT NULL,
     Description TEXT,
-    IsDelete INTEGER DEFAULT 0
+    IsDelete INTEGER DEFAULT 0    -- 软删除标记：0=未删除，1=已删除
 );
 
+-- 权限表：角色-权限多对多关联
 CREATE TABLE IF NOT EXISTS T_Authority (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     RoleId INTEGER NOT NULL,
@@ -83,21 +103,24 @@ CREATE TABLE IF NOT EXISTS T_Authority (
     FOREIGN KEY (RoleId) REFERENCES T_Role(Id)
 );
 
+-- 部门/分支机构表：自引用树形结构
 CREATE TABLE IF NOT EXISTS T_Branch (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Name TEXT NOT NULL,
-    ParentId INTEGER DEFAULT 0,
+    ParentId INTEGER DEFAULT 0,   -- 上级部门 ID，0 表示顶层
     CreateTime TEXT,
     CreateBy INTEGER,
     Remark TEXT
 );
 
+-- 区域表
 CREATE TABLE IF NOT EXISTS T_Area (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Name TEXT NOT NULL,
     Remark TEXT
 );
 
+-- 用户表
 CREATE TABLE IF NOT EXISTS T_User (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Account TEXT UNIQUE,
@@ -112,17 +135,19 @@ CREATE TABLE IF NOT EXISTS T_User (
     FOREIGN KEY (AreaId) REFERENCES T_Area(Id)
 );
 
+-- 用户角色关联表：支持用户绑定多个角色
 CREATE TABLE IF NOT EXISTS T_UserRole (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     UserId INTEGER NOT NULL,
     RoleId INTEGER NOT NULL,
     IsDefault TEXT DEFAULT 'isdefault',
     CreateTime TEXT,
-    IsDeleted TEXT DEFAULT 'undeleted',
+    IsDeleted TEXT DEFAULT 'undeleted',   -- 软删除：'undeleted'/'deleted'
     FOREIGN KEY (UserId) REFERENCES T_User(Id),
     FOREIGN KEY (RoleId) REFERENCES T_Role(Id)
 );
 
+-- 数据字典表：键值对存储，用于下拉选项等可配置枚举
 CREATE TABLE IF NOT EXISTS T_Dictionary (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Key TEXT NOT NULL,
@@ -130,62 +155,65 @@ CREATE TABLE IF NOT EXISTS T_Dictionary (
     Remark TEXT
 );
 
+-- AI 分析盒（边缘设备）表
 CREATE TABLE IF NOT EXISTS T_Device (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
-    MAC TEXT,
+    MAC TEXT,                       -- MAC 地址
     Longitude TEXT,
     Latitude TEXT,
     Address TEXT,
     AreaId INTEGER,
     ModelPerson TEXT,
-    ModelInfo TEXT,
+    ModelInfo TEXT,                 -- 模型信息（如 YOLOv11）
     Maintainer TEXT,
     CreateTime TEXT,
     StructuralInfo TEXT,
     DetailInfo TEXT,
-    LastConnectTime TEXT,
-    AutoGenerateError TEXT DEFAULT 'no',
+    LastConnectTime TEXT,           -- 最后心跳时间
+    AutoGenerateError TEXT DEFAULT 'no',  -- 是否自动生成错误记录
     Remark TEXT,
     FOREIGN KEY (AreaId) REFERENCES T_Area(Id)
 );
 
+-- 摄像头表
 CREATE TABLE IF NOT EXISTS T_Camera (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     IP TEXT,
     MAC TEXT,
-    CameraUrl TEXT,
+    CameraUrl TEXT,                 -- RTSP/RTMP 视频流地址
     Name TEXT,
     Longitude TEXT,
     Latitude TEXT,
     AreaId INTEGER,
-    Type TEXT,
+    Type TEXT,                      -- 摄像头类型（海康、大华等）
     InstallTime TEXT,
     BandWidth REAL,
     Maintainer TEXT,
-    DeviceId INTEGER,
+    DeviceId INTEGER,               -- 所属 AI 分析盒 ID
     Remark TEXT,
     FOREIGN KEY (AreaId) REFERENCES T_Area(Id),
     FOREIGN KEY (DeviceId) REFERENCES T_Device(Id)
 );
 
+-- 火焰检测结果表（核心业务表）
 CREATE TABLE IF NOT EXISTS T_DetectResult (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Longitude TEXT,
     Latitude TEXT,
     Location TEXT,
-    Picture TEXT,
-    VideoUrl TEXT,
+    Picture TEXT,                   -- 报警截图路径
+    VideoUrl TEXT,                  -- 报警录像路径
     AreaId INTEGER,
     CreatTime TEXT,
     CameraId INTEGER,
     DeviceId INTEGER,
-    Status TEXT DEFAULT '1',
-    OperateUserId INTEGER,
+    Status TEXT DEFAULT '1',        -- 状态：'1'=待处理，'2'=已处理（待审核），'3'=已审核
+    OperateUserId INTEGER,          -- 处理人 ID
     OperateTime TEXT,
-    UrgencyDegree TEXT,
-    OperateResult TEXT,
+    UrgencyDegree TEXT,             -- 紧急程度
+    OperateResult TEXT,             -- 处理结果
     Description TEXT,
-    AuditUserId INTEGER,
+    AuditUserId INTEGER,            -- 审核人 ID
     AuditTime TEXT,
     Remark TEXT,
     FOREIGN KEY (AreaId) REFERENCES T_Area(Id),
@@ -195,6 +223,7 @@ CREATE TABLE IF NOT EXISTS T_DetectResult (
     FOREIGN KEY (AuditUserId) REFERENCES T_User(Id)
 );
 
+-- 摄像头错误日志表
 CREATE TABLE IF NOT EXISTS T_CameraError (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     CameraId INTEGER,
@@ -206,6 +235,7 @@ CREATE TABLE IF NOT EXISTS T_CameraError (
     FOREIGN KEY (CameraId) REFERENCES T_Camera(Id)
 );
 
+-- 设备错误日志表
 CREATE TABLE IF NOT EXISTS T_DeviceError (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     DeviceId INTEGER,
@@ -217,28 +247,31 @@ CREATE TABLE IF NOT EXISTS T_DeviceError (
     FOREIGN KEY (DeviceId) REFERENCES T_Device(Id)
 );
 
+-- 操作日志表：记录用户对系统的增删改操作
 CREATE TABLE IF NOT EXISTS T_OperateLog (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
-    MenuName TEXT,
-    Type TEXT,
-    ContentNew TEXT,
-    ContentOld TEXT,
+    MenuName TEXT,                  -- 操作菜单名称
+    Type TEXT,                      -- 操作类型：增加/修改/删除
+    ContentNew TEXT,                -- 新内容（JSON 序列化）
+    ContentOld TEXT,                -- 旧内容
     CreateTime TEXT,
     UserId INTEGER,
     Remark TEXT,
     FOREIGN KEY (UserId) REFERENCES T_User(Id)
 );
 
+-- 用户登录日志表
 CREATE TABLE IF NOT EXISTS T_UserLoginLog (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     UserId INTEGER NOT NULL,
     LoginTime TEXT NOT NULL,
-    LoginInIp TEXT,
-    LoginType TEXT NOT NULL,
+    LoginInIp TEXT,                 -- 登录 IP
+    LoginType TEXT NOT NULL,        -- 登录方式
     FOREIGN KEY (UserId) REFERENCES T_User(Id)
 );
 """)
     db.commit()
+    # 尝试为旧版本数据库添加新增字段（如果字段已存在则忽略异常）
     try:
         db.execute("ALTER TABLE T_DetectResult ADD COLUMN Confidence REAL DEFAULT 0.0")
         db.commit()
@@ -250,39 +283,60 @@ CREATE TABLE IF NOT EXISTS T_UserLoginLog (
     except sqlite3.OperationalError:
         pass
     db.close()
-    seed_data()
+    seed_data()  # 初始化完成后填充种子数据
 
 
 def hash_pwd(pwd):
+    """使用 SHA256 算法对明文密码进行哈希处理。
+    
+    Args:
+        pwd (str): 明文密码
+        
+    Returns:
+        str: 十六进制编码的 SHA256 哈希值
+    """
     return hashlib.sha256(pwd.encode()).hexdigest()
 
 
 def seed_data():
+    """插入系统初始种子数据（仅在数据库为空时执行）。
+    
+    包括：默认系统配置、三种角色（超级管理员/处理人/审核人）及其权限、
+    默认区域、部门、用户账号（admin/chuli001/shenhe001）、数据字典项、
+    示例 AI 分析盒和摄像头。
+    """
     db = sqlite3.connect(str(DB_PATH))
     c = db.execute("SELECT COUNT(*) FROM T_User").fetchone()
     if c and c[0] > 0:
         db.close()
-        return
+        return  # 已有用户数据，跳过种子数据初始化
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 插入默认系统配置
     db.execute("INSERT INTO T_Site (Name, SiteName, thresh, width, height, video_times, heartBeat, exception_times) VALUES (?,?,?,?,?,?,?,?)",
                ("视频AI智能识别及预警管理系统", "火焰预警平台", 0.35, 640, 480, 5, 1, 5))
 
+    # 创建三种预设角色
     db.execute("INSERT INTO T_Role (Id, Name, Description) VALUES (1,'超级管理员','系统最高权限')")
     db.execute("INSERT INTO T_Role (Id, Name, Description) VALUES (2,'处理人','事件处理人员')")
     db.execute("INSERT INTO T_Role (Id, Name, Description) VALUES (3,'审核人','事件审核人员')")
 
+    # 为超级管理员分配所有功能权限
     for auth in ["system_config","department","user","role","device","camera","alarm","audit","log","dashboard","dictionary"]:
         db.execute("INSERT INTO T_Authority (RoleId, Authority) VALUES (1,?)", (auth,))
+    # 处理人权限：报警、摄像头、设备、仪表盘
     for auth in ["alarm","camera","device","dashboard"]:
         db.execute("INSERT INTO T_Authority (RoleId, Authority) VALUES (2,?)", (auth,))
+    # 审核人权限：报警、审核、仪表盘
     for auth in ["alarm","audit","dashboard"]:
         db.execute("INSERT INTO T_Authority (RoleId, Authority) VALUES (3,?)", (auth,))
 
+    # 插入默认区域和部门
     db.execute("INSERT INTO T_Area (Id, Name) VALUES (1,'重庆市'),(2,'北京市'),(3,'上海市'),(4,'广州市'),(5,'成都市')")
     db.execute("INSERT INTO T_Branch (Id, Name, ParentId, CreateTime) VALUES (1,'总公司',0,?),(2,'重庆分公司',1,?),(3,'技术部',1,?),(4,'运维部',1,?)", (now, now, now, now))
 
+    # 创建默认用户（密码统一为 123456 的 SHA256 哈希）
     db.execute("INSERT INTO T_User (Id, Account, Name, AreaId, BranchId, Password, CreateTime) VALUES (1,'admin','系统管理员',1,1,?,?)",
                (hash_pwd("123456"), now))
     db.execute("INSERT INTO T_User (Id, Account, Name, AreaId, BranchId, Password, CreateTime) VALUES (2,'chuli001','张处理',1,3,?,?)",
@@ -290,10 +344,12 @@ def seed_data():
     db.execute("INSERT INTO T_User (Id, Account, Name, AreaId, BranchId, Password, CreateTime) VALUES (3,'shenhe001','李审核',1,4,?,?)",
                (hash_pwd("123456"), now))
 
+    # 绑定用户与角色
     db.execute("INSERT INTO T_UserRole (UserId, RoleId, IsDefault, CreateTime, IsDeleted) VALUES (1,1,'isdefault',?,'undeleted')", (now,))
     db.execute("INSERT INTO T_UserRole (UserId, RoleId, IsDefault, CreateTime, IsDeleted) VALUES (2,2,'isdefault',?,'undeleted')", (now,))
     db.execute("INSERT INTO T_UserRole (UserId, RoleId, IsDefault, CreateTime, IsDeleted) VALUES (3,3,'isdefault',?,'undeleted')", (now,))
 
+    # 填充数据字典（区域、紧急程度、处理结果、摄像头类型、错误代码等枚举值）
     dict_data = [
         ("AreaType", "重庆市"), ("AreaType", "北京市"), ("AreaType", "上海市"), ("AreaType", "广州市"), ("AreaType", "成都市"),
         ("UrgencyDegree", "一般"), ("UrgencyDegree", "紧急"), ("UrgencyDegree", "非常紧急"),
@@ -304,9 +360,11 @@ def seed_data():
     for key, val in dict_data:
         db.execute("INSERT INTO T_Dictionary (Key, Value) VALUES (?,?)", (key, val))
 
+    # 插入示例 AI 分析盒设备
     db.execute("INSERT INTO T_Device (Id, MAC, Longitude, Latitude, Address, AreaId, ModelInfo, CreateTime, LastConnectTime) VALUES (1,'AAABBBCCCDDD','106.551556','29.563009','重庆理工大学花溪校区',1,'YOLOv11-Fire',?,?)", (now, now))
     db.execute("INSERT INTO T_Device (Id, MAC, Longitude, Latitude, Address, AreaId, ModelInfo, CreateTime, LastConnectTime) VALUES (2,'EEEFFFGGGHHH','106.542236','29.606703','重庆理工大学杨家坪校区',1,'YOLOv11-Fire',?,?)", (now, now))
 
+    # 插入示例摄像头
     db.execute("INSERT INTO T_Camera (Id, IP, MAC, CameraUrl, Name, Longitude, Latitude, AreaId, Type, DeviceId, InstallTime) VALUES (1,'192.168.1.101','CAM:AA:BB:CC:01','rtsp://192.168.1.101:554/stream','花溪-教学楼A',?,?,1,'海康威视',1,?)",
                ("106.551556", "29.563009", now))
     db.execute("INSERT INTO T_Camera (Id, IP, MAC, CameraUrl, Name, Longitude, Latitude, AreaId, Type, DeviceId, InstallTime) VALUES (2,'192.168.1.102','CAM:AA:BB:CC:02','rtsp://192.168.1.102:554/stream','花溪-图书馆',?,?,1,'大华',1,?)",
@@ -319,9 +377,17 @@ def seed_data():
     logger.info("Database seeded with initial data")
 
 
-# --- Auth ---
+# --- 认证与授权装饰器及辅助函数 ---
 
 def login_required(f):
+    """登录验证装饰器：未登录用户自动跳转到登录页面。
+    
+    Args:
+        f: 被装饰的视图函数
+        
+    Returns:
+        function: 包装后的函数，仅在 session 中存在 user_id 时才执行原函数
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         if "user_id" not in session:
@@ -331,6 +397,14 @@ def login_required(f):
 
 
 def admin_required(f):
+    """管理员权限装饰器：仅允许 role_id==1（超级管理员）访问，否则提示权限不足并跳转仪表盘。
+    
+    Args:
+        f: 被装饰的视图函数
+        
+    Returns:
+        function: 包装后的函数，仅允许超级管理员执行
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         if session.get("role_id") != 1:
@@ -341,6 +415,11 @@ def admin_required(f):
 
 
 def get_current_user():
+    """获取当前登录用户信息，联表查询获取角色名称。
+    
+    Returns:
+        sqlite3.Row 或 None: 当前登录用户记录（含 RoleName 字段），未登录则返回 None
+    """
     if "user_id" not in session:
         return None
     db = get_db()
@@ -348,6 +427,14 @@ def get_current_user():
 
 
 def add_log(menu_name, op_type, content_new, content_old=""):
+    """记录用户操作日志到 T_OperateLog 表。
+    
+    Args:
+        menu_name (str): 操作菜单名称（如"用户管理"、"系统配置"等）
+        op_type (str): 操作类型（如"增加"、"修改"、"删除"）
+        content_new: 新内容（将被转换为字符串并截断至500字符）
+        content_old: 旧内容（可选，同样截断至500字符）
+    """
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("INSERT INTO T_OperateLog (MenuName, Type, ContentNew, ContentOld, CreateTime, UserId) VALUES (?,?,?,?,?,?)",
@@ -355,22 +442,29 @@ def add_log(menu_name, op_type, content_new, content_old=""):
     db.commit()
 
 
-# --- Routes: Auth ---
+# --- 路由：登录 / 登出 ---
 
 @app.route("/")
 def index():
+    """根路径重定向到仪表盘页面。"""
     return redirect(url_for("dashboard"))
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login_page():
+    """登录页面：GET 展示登录表单，POST 验证账号密码并写入 session。
+    
+    登录成功记录登录日志到 T_UserLoginLog，失败则 flash 提示错误。
+    """
     if request.method == "POST":
         account = request.form.get("account", "")
         password = request.form.get("password", "")
         db = get_db()
+        # 联表查询用户及角色信息（仅查询未删除的角色绑定）
         user = db.execute("SELECT u.*, ur.RoleId FROM T_User u LEFT JOIN T_UserRole ur ON u.Id=ur.UserId WHERE u.Account=? AND ur.IsDeleted='undeleted'",
                           (account,)).fetchone()
         if user and user["Password"] == hash_pwd(password):
+            # 密码验证通过，设置 session
             session["user_id"] = user["Id"]
             session["user_name"] = user["Name"]
             session["role_id"] = user["RoleId"]
@@ -386,22 +480,31 @@ def login_page():
 
 @app.route("/logout")
 def logout():
+    """登出：清除当前 session 并重定向到登录页。"""
     session.clear()
     return redirect(url_for("login_page"))
 
 
-# --- Routes: Dashboard (数据大屏) ---
+# --- 路由：数据大屏仪表盘 ---
 
 @app.route("/dashboard")
 @login_required
 def dashboard():
+    """数据大屏仪表盘：展示今日/本周/本月/本年报警统计、报警状态分布、
+    最新报警列表、各区域月排名、设备与摄像头在地图上的分布等。
+    
+    Returns:
+        str: 渲染后的 HTML 页面
+    """
     user = get_current_user()
     db = get_db()
 
+    # 全局统计：总报警数、待处理数、设备总数
     total_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult").fetchone()["c"]
     pending_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE Status='1'").fetchone()["c"]
     total_devices = db.execute("SELECT COUNT(*) as c FROM T_Device").fetchone()["c"]
 
+    # 计算不同时间段的报警数量
     today_start = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
@@ -412,20 +515,25 @@ def dashboard():
     month_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (month_ago,)).fetchone()["c"]
     year_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (year_ago,)).fetchone()["c"]
 
+    # 按处理结果分类统计：确认真火警 / 误报 / 漏报
     true_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='火灾已确认并报警'").fetchone()["c"]
     false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
     missed_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='漏报记录'").fetchone()["c"]
 
+    # 最新报警列表（优先待处理，按置信度降序、时间降序）
     recent_alarms = [dict(r) for r in db.execute(
         "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.Status ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
 
+    # 最早报警时间（用于数据大屏时间轴起始点）
     earliest_row = db.execute("SELECT MIN(CreatTime) as m FROM T_DetectResult").fetchone()
     earliest_time = earliest_row["m"] if earliest_row and earliest_row["m"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 各区域月度报警排名（Top 5）
     monthly_ranking = [dict(r) for r in db.execute(
         "SELECT COALESCE(a.Name,'?') as name, COUNT(*) as count FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id WHERE dr.CreatTime > ? GROUP BY a.Id ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
-    max_rank = max([r["count"] for r in monthly_ranking]) if monthly_ranking else 1
+    max_rank = max([r["count"] for r in monthly_ranking]) if monthly_ranking else 1  # 排名中的最大值，用于进度条比例
 
+    # 所有摄像头列表（用于地图标注）
     cameras = [dict(r) for r in db.execute("SELECT * FROM T_Camera ORDER BY Id").fetchall()]
 
     return render_template_string(DASHBOARD_TEMPLATE, user=user,
@@ -441,30 +549,35 @@ def dashboard():
                                   cameras=cameras)
 
 
-# --- Routes: System Config ---
+# --- 路由：系统配置 ---
 
 @app.route("/admin/config", methods=["GET", "POST"])
 @login_required
 @admin_required
 def system_config():
+    """系统配置页面：GET 展示当前配置，POST 更新系统参数（站点名、阈值、尺寸等）。
+    
+    仅超级管理员可访问。
+    """
     db = get_db()
     if request.method == "POST":
         data = {k: request.form[k] for k in ["Name", "SiteName", "thresh", "width", "height", "video_times", "heartBeat", "exception_times"]}
         db.execute("UPDATE T_Site SET Name=?, SiteName=?, thresh=?, width=?, height=?, video_times=?, heartBeat=?, exception_times=? WHERE Id=1",
                    (data["Name"], data["SiteName"], float(data["thresh"]), float(data["width"]), float(data["height"]), float(data["video_times"]), float(data["heartBeat"]), float(data["exception_times"])))
         db.commit()
-        add_log("系统配置", "修改", data)
+        add_log("系统配置", "修改", data)  # 记录操作日志
         flash("系统配置已更新")
     site = db.execute("SELECT * FROM T_Site WHERE Id=1").fetchone()
     return render_template_string(CONFIG_TEMPLATE, user=get_current_user(), site=dict(site) if site else {})
 
 
-# --- Routes: Department ---
+# --- 路由：部门管理 ---
 
 @app.route("/admin/branch")
 @login_required
 @admin_required
 def branch_list():
+    """部门管理列表页面：展示所有部门信息。"""
     db = get_db()
     branches = [dict(r) for r in db.execute("SELECT * FROM T_Branch ORDER BY Id").fetchall()]
     return render_template_string(BRANCH_TEMPLATE, user=get_current_user(), branches=branches)
@@ -474,6 +587,7 @@ def branch_list():
 @login_required
 @admin_required
 def branch_add():
+    """新增部门：受理 POST 表单，向 T_Branch 插入新记录。"""
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("INSERT INTO T_Branch (Name, ParentId, CreateTime, CreateBy, Remark) VALUES (?,?,?,?,?)",
@@ -488,6 +602,11 @@ def branch_add():
 @login_required
 @admin_required
 def branch_edit(bid):
+    """编辑部门：根据部门 ID 更新名称、上级部门、备注等信息。
+    
+    Args:
+        bid: 部门 ID
+    """
     db = get_db()
     db.execute("UPDATE T_Branch SET Name=?, ParentId=?, Remark=? WHERE Id=?",
                (request.form["Name"], int(request.form.get("ParentId", 0)), request.form.get("Remark", ""), bid))
@@ -501,6 +620,11 @@ def branch_edit(bid):
 @login_required
 @admin_required
 def branch_delete(bid):
+    """删除部门：物理删除指定 ID 的部门记录。
+    
+    Args:
+        bid: 部门 ID
+    """
     db = get_db()
     db.execute("DELETE FROM T_Branch WHERE Id=?", (bid,))
     db.commit()
@@ -509,12 +633,13 @@ def branch_delete(bid):
     return redirect(url_for("branch_list"))
 
 
-# --- Routes: User ---
+# --- 路由：用户管理 ---
 
 @app.route("/admin/user")
 @login_required
 @admin_required
 def user_list():
+    """用户管理列表页面：联表查询用户信息，含部门、区域、角色名称。"""
     db = get_db()
     users = [dict(r) for r in db.execute(
         "SELECT u.*, b.Name as BranchName, a.Name as AreaName, r.Name as RoleName FROM T_User u LEFT JOIN T_Branch b ON u.BranchId=b.Id LEFT JOIN T_Area a ON u.AreaId=a.Id LEFT JOIN T_UserRole ur ON u.Id=ur.UserId LEFT JOIN T_Role r ON ur.RoleId=r.Id WHERE ur.IsDeleted='undeleted' ORDER BY u.Id").fetchall()]
@@ -528,12 +653,18 @@ def user_list():
 @login_required
 @admin_required
 def user_add():
+    """新增用户：创建用户记录并绑定角色关联。
+    
+    密码经过 SHA256 哈希后存储，操作日志中排除密码字段。
+    """
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pwd = hash_pwd(request.form["Password"])
+    # 插入用户基本信息
     db.execute("INSERT INTO T_User (Account, Name, AreaId, BranchId, Password, CreateTime, CreateBy) VALUES (?,?,?,?,?,?,?)",
                (request.form["Account"], request.form["Name"], int(request.form.get("AreaId", 1)), int(request.form.get("BranchId", 1)), pwd, now, session["user_id"]))
     uid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    # 创建用户角色绑定
     db.execute("INSERT INTO T_UserRole (UserId, RoleId, IsDefault, CreateTime, IsDeleted) VALUES (?,?,?,?,?)",
                (uid, int(request.form.get("RoleId", 2)), request.form.get("IsDefault", "isdefault"), now, "undeleted"))
     db.commit()
@@ -546,15 +677,25 @@ def user_add():
 @login_required
 @admin_required
 def user_edit(uid):
+    """编辑用户：更新用户基本信息和角色绑定。
+    
+    如果未提供新密码则保留原密码不变（仅更新其他字段）。
+    
+    Args:
+        uid: 用户 ID
+    """
     db = get_db()
     pwd = request.form.get("Password", "")
     if pwd:
+        # 提供了新密码，重新哈希后更新
         db.execute("UPDATE T_User SET Account=?, Name=?, AreaId=?, BranchId=?, Password=?, Remark=? WHERE Id=?",
                    (request.form["Account"], request.form["Name"], int(request.form.get("AreaId", 1)), int(request.form.get("BranchId", 1)), hash_pwd(pwd), request.form.get("Remark", ""), uid))
     else:
+        # 未提供密码，忽略密码字段
         db.execute("UPDATE T_User SET Account=?, Name=?, AreaId=?, BranchId=?, Remark=? WHERE Id=?",
                    (request.form["Account"], request.form["Name"], int(request.form.get("AreaId", 1)), int(request.form.get("BranchId", 1)), request.form.get("Remark", ""), uid))
     if request.form.get("RoleId"):
+        # 更新角色绑定
         db.execute("UPDATE T_UserRole SET RoleId=? WHERE UserId=? AND IsDeleted='undeleted'",
                    (int(request.form["RoleId"]), uid))
     db.commit()
@@ -567,6 +708,11 @@ def user_edit(uid):
 @login_required
 @admin_required
 def user_delete(uid):
+    """删除用户：软删除（标记用户角色绑定为 deleted），不物理删除用户记录。
+    
+    Args:
+        uid: 用户 ID
+    """
     db = get_db()
     db.execute("UPDATE T_UserRole SET IsDeleted='deleted' WHERE UserId=?", (uid,))
     db.commit()
@@ -575,12 +721,13 @@ def user_delete(uid):
     return redirect(url_for("user_list"))
 
 
-# --- Routes: Role ---
+# --- 路由：角色管理 ---
 
 @app.route("/admin/role")
 @login_required
 @admin_required
 def role_list():
+    """角色管理列表页面：展示所有未删除的角色。"""
     db = get_db()
     roles = [dict(r) for r in db.execute("SELECT * FROM T_Role WHERE IsDelete=0").fetchall()]
     return render_template_string(ROLE_TEMPLATE, user=get_current_user(), roles=roles)
@@ -590,11 +737,12 @@ def role_list():
 @login_required
 @admin_required
 def role_add():
+    """新增角色：创建角色并批量插入权限记录。"""
     db = get_db()
     db.execute("INSERT INTO T_Role (Name, Description) VALUES (?,?)",
                (request.form["Name"], request.form.get("Description", "")))
-    rid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-    authorities = request.form.getlist("authorities")
+    rid = db.execute("SELECT last_insert_rowid()").fetchone()[0]  # 获取新角色 ID
+    authorities = request.form.getlist("authorities")  # 多选权限列表
     for auth in authorities:
         db.execute("INSERT INTO T_Authority (RoleId, Authority) VALUES (?,?)", (rid, auth))
     db.commit()
@@ -607,9 +755,15 @@ def role_add():
 @login_required
 @admin_required
 def role_edit(rid):
+    """编辑角色：更新角色信息并重建权限（先删后插）。
+    
+    Args:
+        rid: 角色 ID
+    """
     db = get_db()
     db.execute("UPDATE T_Role SET Name=?, Description=? WHERE Id=?",
                (request.form["Name"], request.form.get("Description", ""), rid))
+    # 先删除该角色的所有旧权限，再插入新权限
     db.execute("DELETE FROM T_Authority WHERE RoleId=?", (rid,))
     authorities = request.form.getlist("authorities")
     for auth in authorities:
@@ -624,6 +778,11 @@ def role_edit(rid):
 @login_required
 @admin_required
 def role_delete(rid):
+    """删除角色：软删除（设置 IsDelete=1）。
+    
+    Args:
+        rid: 角色 ID
+    """
     db = get_db()
     db.execute("UPDATE T_Role SET IsDelete=1 WHERE Id=?", (rid,))
     db.commit()
@@ -632,12 +791,13 @@ def role_delete(rid):
     return redirect(url_for("role_list"))
 
 
-# --- Routes: Dictionary ---
+# --- 路由：数据字典管理 ---
 
 @app.route("/admin/dictionary")
 @login_required
 @admin_required
 def dictionary_list():
+    """数据字典管理页面：按 Key 分组展示所有字典项。"""
     db = get_db()
     keys = [dict(r) for r in db.execute("SELECT DISTINCT Key FROM T_Dictionary").fetchall()]
     items = [dict(r) for r in db.execute("SELECT * FROM T_Dictionary ORDER BY Key, Id").fetchall()]
@@ -648,6 +808,7 @@ def dictionary_list():
 @login_required
 @admin_required
 def dictionary_add():
+    """新增字典项：向指定 Key 下添加一条 Value 记录。"""
     db = get_db()
     db.execute("INSERT INTO T_Dictionary (Key, Value, Remark) VALUES (?,?,?)",
                (request.form["Key"], request.form["Value"], request.form.get("Remark", "")))
@@ -660,6 +821,11 @@ def dictionary_add():
 @login_required
 @admin_required
 def dictionary_delete(did):
+    """删除字典项：物理删除指定 ID 的字典记录。
+    
+    Args:
+        did: 字典项 ID
+    """
     db = get_db()
     db.execute("DELETE FROM T_Dictionary WHERE Id=?", (did,))
     db.commit()
@@ -667,11 +833,15 @@ def dictionary_delete(did):
     return redirect(url_for("dictionary_list"))
 
 
-# --- Routes: Device (AI分析盒) ---
+# --- 路由：AI 分析盒（边缘设备）管理 ---
 
 @app.route("/admin/device")
 @login_required
 def device_list():
+    """AI 分析盒列表页面：展示所有边缘设备及其关联的区域名称。
+    
+    注意：此页面未加 @admin_required，允许所有登录用户查看。
+    """
     db = get_db()
     devices = [dict(r) for r in db.execute(
         "SELECT d.*, a.Name as AreaName FROM T_Device d LEFT JOIN T_Area a ON d.AreaId=a.Id ORDER BY d.Id").fetchall()]
@@ -683,6 +853,7 @@ def device_list():
 @login_required
 @admin_required
 def device_add():
+    """新增 AI 分析盒：受理 POST 表单，向 T_Device 插入新记录。"""
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("""INSERT INTO T_Device (MAC, Longitude, Latitude, Address, AreaId, ModelPerson, ModelInfo, Maintainer, CreateTime, StructuralInfo, DetailInfo, Remark)
@@ -701,6 +872,11 @@ def device_add():
 @login_required
 @admin_required
 def device_edit(did):
+    """编辑 AI 分析盒：根据设备 ID 更新设备信息。
+    
+    Args:
+        did: 设备 ID
+    """
     db = get_db()
     db.execute("""UPDATE T_Device SET MAC=?, Longitude=?, Latitude=?, Address=?, AreaId=?, ModelPerson=?, ModelInfo=?, Maintainer=?, StructuralInfo=?, DetailInfo=?, Remark=? WHERE Id=?""",
                (request.form.get("MAC", ""), request.form.get("Longitude", ""), request.form.get("Latitude", ""),
@@ -717,6 +893,11 @@ def device_edit(did):
 @login_required
 @admin_required
 def device_delete(did):
+    """删除 AI 分析盒：物理删除指定 ID 的设备记录。
+    
+    Args:
+        did: 设备 ID
+    """
     db = get_db()
     db.execute("DELETE FROM T_Device WHERE Id=?", (did,))
     db.commit()
@@ -725,11 +906,12 @@ def device_delete(did):
     return redirect(url_for("device_list"))
 
 
-# --- Routes: Camera ---
+# --- 路由：摄像头管理 ---
 
 @app.route("/admin/camera")
 @login_required
 def camera_list():
+    """摄像头列表页面：联表查询摄像头及关联的设备、区域信息。"""
     db = get_db()
     cameras = [dict(r) for r in db.execute(
         "SELECT c.*, a.Name as AreaName, d.MAC as DeviceMAC, d.Address as DeviceAddress FROM T_Camera c LEFT JOIN T_Area a ON c.AreaId=a.Id LEFT JOIN T_Device d ON c.DeviceId=d.Id ORDER BY c.Id").fetchall()]
@@ -742,6 +924,7 @@ def camera_list():
 @login_required
 @admin_required
 def camera_add():
+    """新增摄像头：受理 POST 表单，向 T_Camera 插入新记录。"""
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("""INSERT INTO T_Camera (IP, MAC, CameraUrl, Name, Longitude, Latitude, AreaId, Type, InstallTime, BandWidth, Maintainer, DeviceId, Remark)
@@ -761,6 +944,11 @@ def camera_add():
 @login_required
 @admin_required
 def camera_edit(cid):
+    """编辑摄像头：根据摄像头 ID 更新摄像头信息。
+    
+    Args:
+        cid: 摄像头 ID
+    """
     db = get_db()
     db.execute("""UPDATE T_Camera SET IP=?, MAC=?, CameraUrl=?, Name=?, Longitude=?, Latitude=?, AreaId=?, Type=?, BandWidth=?, Maintainer=?, DeviceId=?, Remark=? WHERE Id=?""",
                (request.form.get("IP", ""), request.form.get("MAC", ""), request.form.get("CameraUrl", ""),
@@ -778,6 +966,11 @@ def camera_edit(cid):
 @login_required
 @admin_required
 def camera_delete(cid):
+    """删除摄像头：物理删除指定 ID 的摄像头记录。
+    
+    Args:
+        cid: 摄像头 ID
+    """
     db = get_db()
     db.execute("DELETE FROM T_Camera WHERE Id=?", (cid,))
     db.commit()
@@ -786,11 +979,12 @@ def camera_delete(cid):
     return redirect(url_for("camera_list"))
 
 
-# --- Routes: Alarm Events ---
+# --- 路由：报警事件管理 ---
 
 @app.route("/admin/alarm")
 @login_required
 def alarm_list():
+    """报警事件列表页面：按创建时间降序展示所有检测结果。"""
     db = get_db()
     alarms = [dict(r) for r in db.execute(
         "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, d.Address as DeviceAddress, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_Device d ON dr.DeviceId=d.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.CreatTime DESC").fetchall()]
@@ -800,6 +994,11 @@ def alarm_list():
 @app.route("/admin/alarm/process/<int:aid>", methods=["POST"])
 @login_required
 def alarm_process(aid):
+    """处理报警事件：更新报警状态为已处理，记录处理人、紧急程度、处理结果等。
+    
+    Args:
+        aid: 报警记录 ID
+    """
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("UPDATE T_DetectResult SET Status='2', OperateUserId=?, OperateTime=?, UrgencyDegree=?, OperateResult=?, Description=? WHERE Id=?",
@@ -807,6 +1006,7 @@ def alarm_process(aid):
     db.commit()
     add_log("报警事件", "处理", {"alarm_id": aid, "result": request.form.get("OperateResult", "")})
     flash("事件已处理")
+    # 根据来源页面智能跳转回原页面
     ref = request.referrer
     if ref:
         if "/dashboard" in ref:
@@ -819,6 +1019,11 @@ def alarm_process(aid):
 @app.route("/admin/alarm/clear_all", methods=["POST"])
 @login_required
 def admin_alarm_clear_all():
+    """一键清空（批量处理）所有待处理报警：将所有 Status='1' 的报警标记为已处理/误报。
+    
+    Returns:
+        JSON 响应，包含处理结果状态码。
+    """
     try:
         db = get_db()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -831,14 +1036,15 @@ def admin_alarm_clear_all():
         return jsonify({"code": 500, "msg": str(e)}), 500
 
 
-# --- Routes: Event Audit ---
+# --- 路由：事件审核 ---
 
 @app.route("/admin/audit")
 @login_required
 def audit_list():
+    """事件审核列表：仅超级管理员和审核人可访问，展示状态为'已处理/待审核'的报警记录。"""
     db = get_db()
     user = get_current_user()
-    # If the user is neither SuperAdmin nor Auditor, redirect to dashboard or show unauthorized
+    # 权限检查：只有超级管理员和审核人可以进入审核页面
     if user["RoleName"] not in ["超级管理员", "审核人"]:
         flash("您没有审核权限")
         return redirect(url_for("dashboard"))
@@ -851,6 +1057,11 @@ def audit_list():
 @app.route("/admin/audit/approve/<int:aid>")
 @login_required
 def audit_approve(aid):
+    """审核通过：将报警状态更新为 '3'（已审核），记录审核人和审核时间。
+    
+    Args:
+        aid: 报警记录 ID
+    """
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("UPDATE T_DetectResult SET Status='3', AuditUserId=?, AuditTime=? WHERE Id=?",
@@ -870,6 +1081,11 @@ def audit_approve(aid):
 @app.route("/admin/audit/reject/<int:aid>")
 @login_required
 def audit_reject(aid):
+    """审核驳回：将报警状态回退为 '1'（待处理），需要重新处理。
+    
+    Args:
+        aid: 报警记录 ID
+    """
     db = get_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("UPDATE T_DetectResult SET Status='1', AuditUserId=?, AuditTime=? WHERE Id=?",
@@ -886,33 +1102,36 @@ def audit_reject(aid):
     return redirect(url_for("audit_list"))
 
 
-# --- Routes: Camera Error ---
+# --- 路由：摄像头错误日志 ---
 
 @app.route("/admin/camera_error")
 @login_required
 def camera_error_list():
+    """摄像头错误日志列表页面：联表查询摄像头名称，按时间降序展示。"""
     db = get_db()
     errors = [dict(r) for r in db.execute(
         "SELECT ce.*, c.Name as CameraName FROM T_CameraError ce LEFT JOIN T_Camera c ON ce.CameraId=c.Id ORDER BY ce.CreateTime DESC").fetchall()]
     return render_template_string(CAMERA_ERROR_TEMPLATE, user=get_current_user(), errors=errors)
 
 
-# --- Routes: Device Error ---
+# --- 路由：设备错误日志 ---
 
 @app.route("/admin/device_error")
 @login_required
 def device_error_list():
+    """设备错误日志列表页面：联表查询设备地址和 MAC，按时间降序展示。"""
     db = get_db()
     errors = [dict(r) for r in db.execute(
         "SELECT de.*, d.Address as DeviceAddress, d.MAC as DeviceMAC FROM T_DeviceError de LEFT JOIN T_Device d ON de.DeviceId=d.Id ORDER BY de.CreateTime DESC").fetchall()]
     return render_template_string(DEVICE_ERROR_TEMPLATE, user=get_current_user(), errors=errors)
 
 
-# --- Routes: Logs ---
+# --- 路由：系统日志 ---
 
 @app.route("/admin/log/access")
 @login_required
 def access_log():
+    """登录日志页面：展示最近 200 条用户登录记录（含用户名）。"""
     db = get_db()
     logs = [dict(r) for r in db.execute(
         "SELECT l.*, u.Name as UserName FROM T_UserLoginLog l LEFT JOIN T_User u ON l.UserId=u.Id ORDER BY l.LoginTime DESC LIMIT 200").fetchall()]
@@ -922,16 +1141,25 @@ def access_log():
 @app.route("/admin/log/operate")
 @login_required
 def operate_log():
+    """操作日志页面：展示最近 200 条用户操作记录（含用户名）。"""
     db = get_db()
     logs = [dict(r) for r in db.execute(
         "SELECT l.*, u.Name as UserName FROM T_OperateLog l LEFT JOIN T_User u ON l.UserId=u.Id ORDER BY l.CreateTime DESC LIMIT 200").fetchall()]
     return render_template_string(OPERATE_LOG_TEMPLATE, user=get_current_user(), logs=logs)
 
 
-# --- API: Edge Device Communication ---
+# --- API 路由：边缘设备通信接口 ---
 
 @app.route("/api/device/heartbeat", methods=["POST"])
 def api_heartbeat():
+    """设备心跳接口：接收边缘设备定期上报的状态信息。
+    
+    自动更新设备最后连接时间，同步摄像头位置和 WebSocket 端口信息，
+    并返回当前系统配置（阈值、尺寸等）供设备使用。
+    
+    Returns:
+        JSON: {"code": 200, "msg": "ok", "config": {...}} 或错误信息
+    """
     try:
         data = request.get_json()
         if not data:
@@ -940,15 +1168,19 @@ def api_heartbeat():
         did = data.get("device_id", 1)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         db = get_db()
+        # 查找已注册设备：优先 MAC 匹配，其次 ID 匹配
         device = db.execute("SELECT * FROM T_Device WHERE MAC=? OR Id=?", (mac, did)).fetchone()
         if device:
+            # 已存在设备，更新连接时间并清除自动错误标记
             db.execute("UPDATE T_Device SET LastConnectTime=?, AutoGenerateError='no' WHERE Id=?",
                        (now, device["Id"]))
         else:
+            # 新设备自动注册
             auto_err = "yes" if data.get("status") != "online" else "no"
             db.execute("""INSERT INTO T_Device (MAC, ModelInfo, LastConnectTime, AutoGenerateError)
                 VALUES (?,?,?,?)""", (mac, data.get("model_info", "YOLOv11"), now, auto_err))
         
+        # 同步摄像头信息：如果心跳携带 camera_id，则更新或创建摄像头记录
         camera_id = data.get("camera_id")
         if camera_id:
             loc = data.get("location")
@@ -959,6 +1191,7 @@ def api_heartbeat():
             else:
                 db.execute("INSERT INTO T_Camera (Id, Name, WsPort, DeviceId) VALUES (?, ?, ?, ?)", (camera_id, loc, port, did))
         db.commit()
+        # 读取系统配置并返回给设备
         site = db.execute("SELECT * FROM T_Site WHERE Id=1").fetchone()
         config = {"thresh": site["thresh"], "width": site["width"], "height": site["height"],
                   "video_times": site["video_times"], "heartBeat": site["heartBeat"], "exception_times": site["exception_times"]} if site else {}
@@ -970,10 +1203,19 @@ def api_heartbeat():
 
 @app.route("/api/alarm", methods=["POST"])
 def api_alarm():
+    """火焰报警上报接口：接收边缘设备检测到的火焰报警数据。
+    
+    支持上传截图（picture）和录像（video）文件，解析检测结果中的最大置信度，
+    存储到 T_DetectResult 表。
+    
+    Returns:
+        JSON: {"code": 200, "msg": "ok", "alarm_id": id} 或错误信息
+    """
     try:
         db = get_db()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # 处理上传的截图文件
         picture_file = request.files.get("picture")
         video_file = request.files.get("video")
         picture_path = ""
@@ -993,6 +1235,7 @@ def api_alarm():
             video_file.save(str(filepath))
             video_path = f"/uploads/videos/{filename}"
 
+        # 解析检测结果 JSON，提取最大置信度
         import json
         detections_json = request.form.get("detections", "[]")
         max_conf = 0.0
@@ -1003,6 +1246,7 @@ def api_alarm():
         except Exception:
             pass
 
+        # 插入报警记录，状态默认为 '1'（待处理）
         desc = request.form.get("description", "")
         db.execute("""INSERT INTO T_DetectResult (Longitude, Latitude, Location, Picture, VideoUrl, AreaId, CreatTime, CameraId, DeviceId, Status, Confidence, Description)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -1021,6 +1265,11 @@ def api_alarm():
 
 @app.route("/api/device/error", methods=["POST"])
 def api_device_error():
+    """设备错误上报接口：接收边缘设备发送的错误信息，写入 T_DeviceError 表。
+    
+    Returns:
+        JSON: {"code": 200, "msg": "ok"} 或错误信息
+    """
     try:
         data = request.get_json()
         db = get_db()
@@ -1035,21 +1284,39 @@ def api_device_error():
 
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
+    """提供上传文件的静态访问，如截图、录像、Logo 等。
+    
+    Args:
+        filename: 相对于 uploads 目录的文件路径
+        
+    Returns:
+        Flask 文件响应
+    """
     return send_from_directory(str(UPLOAD_DIR), filename)
 
 
 @app.route("/api/stats")
 @login_required
 def api_stats():
+    """数据统计 API：返回大屏仪表盘所需的各类统计数据（JSON 格式）。
+    
+    包含区域分布、时间趋势、真假漏报统计、近期报警列表、月度排行等。
+    
+    Returns:
+        JSON: 包含所有统计数据的字典
+    """
     db = get_db()
+    # 各区域报警数量分布（用于地图热力图/柱状图）
     area = [dict(r) for r in db.execute(
         "SELECT a.Name as name, COUNT(dr.Id) as value FROM T_Area a LEFT JOIN T_DetectResult dr ON a.Id=dr.AreaId GROUP BY a.Id").fetchall()]
+    # 近30天每日报警趋势
     time_data = [dict(r) for r in db.execute(
         "SELECT strftime('%Y-%m-%d', CreatTime) as date, COUNT(*) as count FROM T_DetectResult WHERE CreatTime > datetime('now','-30 day') GROUP BY date ORDER BY date").fetchall()]
     total = db.execute("SELECT COUNT(*) as c FROM T_DetectResult").fetchone()["c"]
 
     pending_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE Status='1'").fetchone()["c"]
 
+    # 各时间段统计数据
     today_start = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1060,9 +1327,11 @@ def api_stats():
     month_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (month_ago,)).fetchone()["c"]
     year_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (year_ago,)).fetchone()["c"]
 
+    # 最新报警列表（优先待处理，按置信度降序）
     recent_alarms = [dict(r) for r in db.execute(
         "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.Status ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
 
+    # 真火警 / 误报 / 漏报 分类统计
     true_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='火灾已确认并报警'").fetchone()["c"]
     false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
     missed_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='漏报记录'").fetchone()["c"]
@@ -1070,6 +1339,7 @@ def api_stats():
     earliest_row = db.execute("SELECT MIN(CreatTime) as m FROM T_DetectResult").fetchone()
     earliest_time = earliest_row["m"] if earliest_row and earliest_row["m"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 月度区域报警排名（Top 5）
     monthly_ranking = [dict(r) for r in db.execute(
         "SELECT COALESCE(a.Name,'?') as name, COUNT(*) as count FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id WHERE dr.CreatTime > ? GROUP BY a.Id ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
     max_rank = max([r["count"] for r in monthly_ranking]) if monthly_ranking else 1
@@ -1093,8 +1363,9 @@ def api_stats():
     })
 
 
-# --- Templates ---
+# --- HTML 模板定义 ---
 
+# 登录页面模板
 LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1155,6 +1426,7 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
+# 管理后台公共导航栏组件模板（固定顶部）
 BASE_NAV = """
 <header class="flex justify-between items-center h-14 border-b border-slate-800/60 bg-slate-950/80 backdrop-blur-md px-6 z-[1000] w-full fixed top-0 left-0 right-0 text-slate-100 font-sans">
   <div class="flex items-center gap-3">
@@ -1220,6 +1492,7 @@ document.addEventListener("DOMContentLoaded", function() {
 </script>
 """
 
+# 数据大屏仪表盘模板（ECharts + 百度地图）
 DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -2286,6 +2559,18 @@ document.addEventListener("DOMContentLoaded", function() {
 """
 
 def make_admin_template(title, content_html, active_menu):
+    """构建管理后台通用页面模板：拼接公共导航栏 + 左侧边栏 + 主体内容区域。
+    
+    根据 active_menu 参数高亮当前侧边栏菜单项。非超级管理员用户不显示资源管理和系统设置菜单。
+    
+    Args:
+        title (str): 页面标题（显示在浏览器标签页）
+        content_html (str): 主体内容区域的 HTML 代码
+        active_menu (str): 当前活跃菜单标识（如 'device', 'alarm', 'config' 等）
+        
+    Returns:
+        str: 完整的 HTML 页面字符串
+    """
     return """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2403,6 +2688,7 @@ def make_admin_template(title, content_html, active_menu):
 </html>
 """
 
+# 系统参数配置页面模板（超级管理员可见，用于修改检测阈值、视频参数、心跳间隔等全局设置）
 CONFIG_TEMPLATE = make_admin_template("系统参数配置", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -2468,6 +2754,7 @@ CONFIG_TEMPLATE = make_admin_template("系统参数配置", """
 </div>
 """, "config")
 
+# 部门/机构管理页面模板（支持树形结构、新增、编辑、删除操作）
 BRANCH_TEMPLATE = make_admin_template("部门管理", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -2598,6 +2885,7 @@ function editBranch(id,name,parent,remark){
 </script>
 """, "branch")
 
+# 用户账户管理页面模板（支持新增、编辑、软删除，含账号/姓名/部门/区域/角色字段）
 USER_TEMPLATE = make_admin_template("用户管理", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -2784,6 +3072,7 @@ function editUser(id,acc,name,area,branch,roleName){
 </script>
 """, "user")
 
+# 角色权限管理页面模板（支持多选权限分配，权限列表包括系统配置、部门、用户、角色、设备、摄像头、报警、审核、日志、仪表盘、字典）
 ROLE_TEMPLATE = make_admin_template("角色管理", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -2881,6 +3170,7 @@ function closeAddModal() { document.getElementById('addModal').classList.add('hi
 </script>
 """, "role")
 
+# 数据字典管理页面模板（Key-Value 键值对，用于下拉选项等可配置枚举值的维护）
 DICT_TEMPLATE = make_admin_template("数据字典", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -2971,6 +3261,7 @@ function closeAddModal() { document.getElementById('addModal').classList.add('hi
 </script>
 """, "dictionary")
 
+# AI分析盒（边缘计算设备）管理页面模板（维护MAC、位置、区域、模型版本等信息）
 DEVICE_TEMPLATE = make_admin_template("AI分析盒管理", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -3148,6 +3439,7 @@ function editDevice(id,mac,lng,lat,addr,area,model){
 </script>
 """, "device")
 
+# 摄像头管理页面模板（维护IP、MAC、RTSP流地址、型号、关联AI分析盒等信息）
 CAMERA_TEMPLATE = make_admin_template("摄像头管理", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -3372,6 +3664,7 @@ function editCam(id,ip,mac,url,name,lng,lat,area,type,did){
 </script>
 """, "camera")
 
+# 报警事件管理页面模板（按时间降序展示，支持按位置/时间/状态筛选，含详情弹窗处理功能）
 ALARM_TEMPLATE = make_admin_template("报警事件", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -3799,6 +4092,7 @@ function clearFilters() {
 </script>
 """, "alarm")
 
+# 事件处理审核页面模板（仅审核人和超管可访问，展示待审核事件，支持通过/驳回操作）
 AUDIT_TEMPLATE = make_admin_template("事件处理审核", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -3857,6 +4151,7 @@ AUDIT_TEMPLATE = make_admin_template("事件处理审核", """
 </div>
 """, "audit")
 
+# 摄像头故障日志页面模板（展示摄像头异常错误记录，含错误码和详细描述）
 CAMERA_ERROR_TEMPLATE = make_admin_template("摄像头故障日志", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -3900,6 +4195,7 @@ CAMERA_ERROR_TEMPLATE = make_admin_template("摄像头故障日志", """
 </div>
 """, "camera_error")
 
+# AI分析盒故障日志页面模板（展示边缘设备异常错误记录，含错误码和详细描述）
 DEVICE_ERROR_TEMPLATE = make_admin_template("AI分析盒故障日志", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -3943,6 +4239,7 @@ DEVICE_ERROR_TEMPLATE = make_admin_template("AI分析盒故障日志", """
 </div>
 """, "device_error")
 
+# 安全访问日志页面模板（展示用户登录记录，包含登录时间、IP、方式等信息）
 ACCESS_LOG_TEMPLATE = make_admin_template("访问安全日志", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -3984,6 +4281,7 @@ ACCESS_LOG_TEMPLATE = make_admin_template("访问安全日志", """
 </div>
 """, "access_log")
 
+# 业务操作日志页面模板（展示用户的增删改操作记录，包含功能模块、操作类型、变更内容和执行人信息）
 OPERATE_LOG_TEMPLATE = make_admin_template("操作日志", """
 <div class="flex flex-col gap-6">
   <div class="flex justify-between items-center border-b border-slate-800 pb-4">
@@ -4029,8 +4327,11 @@ OPERATE_LOG_TEMPLATE = make_admin_template("操作日志", """
 
 
 
+
+
+# --- 应用入口：初始化数据库并启动 Flask Web 服务器 ---
 if __name__ == "__main__":
-    init_db()
+    init_db()  # 创建表结构并填充种子数据（仅在首次运行时）
     logger.info("Starting Web Management Server...")
     logger.info("访问地址: http://0.0.0.0:5000")
     logger.info("管理员: admin / 123456")
