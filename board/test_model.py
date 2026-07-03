@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-🔥 YOLOv11 火焰检测 终极可视化平台 (支持 摄像头/图片/视频)
-直接运行: python3 test_gui.py
+YOLOv11 火焰检测 Qt 可视化测试平台
+支持三种检测模式：摄像头实时检测 / 图片检测 / 视频检测
+直接运行: python3 test_model.py
+
+依赖: PySide6 或 PyQt5, OpenCV, Ultralytics YOLO
 """
 
 import sys
@@ -10,7 +13,7 @@ import time
 import os
 from ultralytics import YOLO
 
-# 智能导入 Qt 库 (支持 PySide6 或 PyQt5)
+# 智能导入 Qt 库，优先使用 PySide6，若不可用则回退到 PyQt5
 try:
     from PySide6.QtWidgets import (
         QApplication,
@@ -26,6 +29,7 @@ try:
     from PySide6.QtGui import QImage, QPixmap, QFont
     from PySide6.QtCore import QThread, Signal, Qt
 except ImportError:
+    # PySide6 不可用时回退到 PyQt5
     from PyQt5.QtWidgets import (
         QApplication,
         QLabel,
@@ -38,14 +42,22 @@ except ImportError:
         QFrame,
     )
     from PyQt5.QtGui import QImage, QPixmap, QFont
-    from PyQt5.QtCore import QThread, pyqtSignal as Signal, Qt
+    from PyQt5.QtCore import QThread, pyqtSignal as Signal, Qt  # PyQt5 的信号名不同
 
-# 你的模型路径
+# 默认模型路径（需根据实际训练结果调整）
 model_path = "/home/value/Keshe/fire/board/runs/detect/fire_detect/weights/best.pt"
 
 
 class YOLOThread(QThread):
-    """通用后台推理线程：处理摄像头、视频、单张图片"""
+    """通用 YOLO 后台推理线程
+
+    负责在独立线程中执行模型推理，避免阻塞 Qt 主界面，
+    支持摄像头、视频文件、单张图片三种数据源。
+
+    信号:
+        frame_signal (QImage): 每帧推理完成后发射，携带标注后的图像
+        info_signal (str): 状态信息文本，如"摄像头掉线"、"视频播放结束"等
+    """
 
     frame_signal = Signal(QImage)
     info_signal = Signal(str)
@@ -53,26 +65,36 @@ class YOLOThread(QThread):
     def __init__(self):
         super().__init__()
         self.running = False
-        self.source_type = None  # 'camera', 'image', 'video'
+        self.source_type = None  # 数据源类型: 'camera' / 'image' / 'video'
         self.source_path = None
 
-        # 加载模型
+        # 加载 YOLO 模型，若模型文件不存在则设为 None（后续 run 会提示错误）
         if os.path.exists(model_path):
             self.model = YOLO(model_path)
         else:
             self.model = None
 
     def set_source(self, source_type, path=0):
-        """设置当前要检测的数据源"""
+        """设置当前要检测的数据源
+
+        参数:
+            source_type (str): 数据源类型，'camera'/'image'/'video'
+            path: 摄像头编号（int）、图片路径或视频路径
+        """
         self.source_type = source_type
         self.source_path = path
 
     def process_frame(self, frame, start_time=None):
-        """核心 YOLO 推理与画图逻辑"""
-        results = self.model(frame, conf=0.35, imgsz=480, verbose=False)
-        annotated = results[0].plot()
+        """对单帧图像执行 YOLO 推理并绘制检测结果
 
-        # 计算 FPS
+        参数:
+            frame (numpy.ndarray): OpenCV BGR 格式图像帧
+            start_time (float, 可选): 帧接收时间戳，用于计算实时 FPS
+        """
+        results = self.model(frame, conf=0.35, imgsz=480, verbose=False)
+        annotated = results[0].plot()  # 在图像上绘制检测框和标签
+
+        # 如果提供了时间戳，计算并显示实时 FPS
         if start_time:
             fps = 1.0 / (time.time() - start_time)
             cv2.putText(
@@ -85,24 +107,26 @@ class YOLOThread(QThread):
                 2,
             )
 
+        # 显示检测到的目标数量
         count = len(results[0].boxes)
         cv2.putText(
             annotated,
             f"Detected: {count}",
-            (10, 75 if start_time else 35),
+            (10, 75 if start_time else 35),  # 有 FPS 显示时向下偏移，避免重叠
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
             (0, 255, 0),
             2,
         )
 
-        # 转换为 Qt 图像
+        # 将 OpenCV BGR 图像转为 Qt RGB 图像并发射信号到主线程
         rgb_img = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_img.shape
         qt_img = QImage(rgb_img.data, w, h, ch * w, QImage.Format_RGB888)
         self.frame_signal.emit(qt_img)
 
     def run(self):
+        """QThread 主循环：根据数据源类型执行不同的检测逻辑"""
         if self.model is None:
             self.info_signal.emit("❌ 模型未找到，请检查路径！")
             return
@@ -110,7 +134,7 @@ class YOLOThread(QThread):
         self.running = True
 
         if self.source_type == "image":
-            # === 图片处理模式 ===
+            # --- 图片检测模式：单次推理 ---
             self.info_signal.emit(
                 f"🖼️ 正在检测图片: {os.path.basename(self.source_path)}"
             )
@@ -120,26 +144,29 @@ class YOLOThread(QThread):
             self.running = False  # 图片只需处理一次
 
         else:
-            # === 摄像头 / 视频处理模式 ===
+            # --- 视频流模式：摄像头或视频文件连续检测 ---
             cap = cv2.VideoCapture(self.source_path)
 
             if self.source_type == "camera":
+                # 摄像头模式：设置分辨率并尽可能快速处理
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 self.info_signal.emit("📷 摄像头实时检测中...")
-                delay = 10  # 尽量快
+                delay = 10  # 延时最小化以实现高帧率
             else:
+                # 视频文件模式：按原始帧率播放
                 self.info_signal.emit(
                     f"🎞️ 正在播放视频: {os.path.basename(self.source_path)}"
                 )
                 fps = cap.get(cv2.CAP_PROP_FPS)
-                delay = int(1000 / fps) if fps > 0 else 30  # 按视频原始帧率播放
+                delay = int(1000 / fps) if fps > 0 else 30  # 计算每帧间隔（毫秒）
 
             while self.running:
                 start_time = time.time()
                 ret, frame = cap.read()
 
                 if not ret:
+                    # 视频播完或摄像头掉线处理
                     if self.source_type == "video":
                         self.info_signal.emit("✅ 视频播放结束。")
                     else:
@@ -148,36 +175,40 @@ class YOLOThread(QThread):
 
                 self.process_frame(frame, start_time)
 
-                # 睡眠以控制帧率并让出 CPU 给主界面渲染
+                # 延时以控制帧率，同时让出 CPU 给 Qt 主界面渲染
                 QThread.msleep(delay)
 
             cap.release()
 
     def stop(self):
-        """安全停止线程"""
+        """安全停止线程：设置停止标志并等待线程结束"""
         self.running = False
         self.wait()
 
 
 class MainWindow(QMainWindow):
-    """主程序界面"""
+    """火焰烟雾智能监测系统主窗口
+
+    左侧控制面板：摄像头/图片/视频/停止四个操作按钮
+    右侧显示面板：实时视频画面和底部状态栏
+    """
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🔥 YOLOv11 火焰烟雾智能监测系统")
         self.resize(1000, 700)
-        self.current_qimage = None  # 缓存当前画面，用于调整窗口大小时重新缩放
+        self.current_qimage = None  # 缓存当前画面，用于窗口调整大小时重新缩放
 
-        # --- 初始化 UI ---
         self.init_ui()
 
-        # --- 初始化后台线程 ---
+        # 初始化后台推理线程并连接信号槽
         self.thread = YOLOThread()
-        self.thread.frame_signal.connect(self.update_frame)
-        self.thread.info_signal.connect(self.update_status)
+        self.thread.frame_signal.connect(self.update_frame)   # 画面更新
+        self.thread.info_signal.connect(self.update_status)   # 状态更新
 
     def init_ui(self):
-        # 主挂载点
+        """初始化用户界面布局"""
+        # 中央主挂载部件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
@@ -196,7 +227,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(title)
         control_layout.addSpacing(20)
 
-        # 按钮样式
+        # 按钮通用样式
         btn_style = """
             QPushButton {
                 background-color: #4CAF50; color: white; border: none; 
@@ -206,22 +237,26 @@ class MainWindow(QMainWindow):
             QPushButton:pressed { background-color: #388E3C; }
         """
 
+        # 摄像头按钮（绿色）
         self.btn_camera = QPushButton("📷 开启摄像头")
         self.btn_camera.setStyleSheet(btn_style)
         self.btn_camera.clicked.connect(self.start_camera)
 
+        # 图片检测按钮（蓝色）
         self.btn_image = QPushButton("🖼️ 选择图片检测")
         self.btn_image.setStyleSheet(
             btn_style.replace("#4CAF50", "#2196F3").replace("#45a049", "#1E88E5")
         )
         self.btn_image.clicked.connect(self.start_image)
 
+        # 视频检测按钮（橙色）
         self.btn_video = QPushButton("🎞️ 选择视频检测")
         self.btn_video.setStyleSheet(
             btn_style.replace("#4CAF50", "#FF9800").replace("#45a049", "#F57C00")
         )
         self.btn_video.clicked.connect(self.start_video)
 
+        # 停止按钮（红色）
         self.btn_stop = QPushButton("🛑 停止当前任务")
         self.btn_stop.setStyleSheet(
             btn_style.replace("#4CAF50", "#F44336").replace("#45a049", "#E53935")
@@ -233,7 +268,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.btn_image)
         control_layout.addSpacing(10)
         control_layout.addWidget(self.btn_video)
-        control_layout.addStretch()
+        control_layout.addStretch()  # 弹性空间将停止按钮推到底部
         control_layout.addWidget(self.btn_stop)
 
         # --- 右侧显示面板 ---
@@ -260,11 +295,13 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(display_panel)
 
     def start_camera(self):
+        """启动摄像头实时检测模式"""
         self.thread.stop()
-        self.thread.set_source("camera", 0)
+        self.thread.set_source("camera", 0)  # 0 = 系统默认摄像头
         self.thread.start()
 
     def start_image(self):
+        """弹出文件对话框选择图片，启动单张图片检测模式"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择要检测的图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp)"
         )
@@ -274,6 +311,7 @@ class MainWindow(QMainWindow):
             self.thread.start()
 
     def start_video(self):
+        """弹出文件对话框选择视频文件，启动视频检测模式"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择要检测的视频", "", "视频文件 (*.mp4 *.avi *.mkv *.mov)"
         )
@@ -283,34 +321,43 @@ class MainWindow(QMainWindow):
             self.thread.start()
 
     def stop_current(self):
+        """停止当前正在执行的检测任务"""
         self.thread.stop()
         self.video_label.clear()
         self.video_label.setText("已停止检测。")
         self.status_label.setText("系统空闲")
 
     def update_frame(self, qt_img):
-        """刷新画面"""
-        self.current_qimage = qt_img
+        """刷新显示画面：将推理线程传来的 QImage 缩放并显示
+
+        参数:
+            qt_img (QImage): 推理线程处理并标注后的图像
+        """
+        self.current_qimage = qt_img  # 缓存原始图像，用于窗口缩放时重绘
         scaled_img = qt_img.scaled(
             self.video_label.width(),
             self.video_label.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+            Qt.KeepAspectRatio,         # 保持原始宽高比
+            Qt.SmoothTransformation,     # 平滑缩放，避免锯齿
         )
         self.video_label.setPixmap(QPixmap.fromImage(scaled_img))
 
     def update_status(self, text):
-        """刷新底部状态栏"""
+        """刷新底部状态栏文本
+
+        参数:
+            text (str): 状态信息
+        """
         self.status_label.setText(text)
 
     def resizeEvent(self, event):
-        """窗口大小改变时，保证图片按比例自适应且不失真"""
+        """窗口大小改变时重新缩放显示图像，保持比例且不失真"""
         if self.current_qimage is not None:
             self.update_frame(self.current_qimage)
         super().resizeEvent(event)
 
     def closeEvent(self, event):
-        """退出程序时安全释放线程"""
+        """关闭窗口时安全停止后台推理线程，避免资源泄漏"""
         self.thread.stop()
         event.accept()
 

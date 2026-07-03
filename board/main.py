@@ -7,16 +7,25 @@
 import os
 import sys
 
+# 设置 Qt 平台插件，确保在 Linux 下正常显示 GUI
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 
+# 将当前目录加入模块搜索路径，便于导入同目录下的 flame_detect 模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flame_detect import FlameDetector, Config
 
 def show_interactive_menu():
+    """显示交互式启动菜单，允许用户选择启动模式或自定义配置参数
+
+    返回值:
+        Config: 根据用户交互生成的配置对象
+    """
+    # 从与当前脚本同级目录加载 JSON 配置文件
     config_path = os.path.join(os.path.dirname(__file__), "flame_config.json")
     cfg = Config(config_path)
 
+    # 打印启动菜单
     print("\n" + "="*60)
     print("🔥 YOLOv11 火焰烟雾智能监测系统 - 设备端启动平台")
     print("="*60)
@@ -32,15 +41,16 @@ def show_interactive_menu():
         sys.exit(0)
         
     if choice == "2":
+        # 自定义启动模式：逐项配置参数
         print("\n--- 交互式初始化配置 ---")
         
-        # 1. Custom Location
+        # 1. 配置安装地点
         default_loc = cfg.location
         loc_input = input(f"📍 请输入安装地点 (当前默认: '{default_loc}'): ").strip()
         if loc_input:
             cfg._cfg["location"] = loc_input
             
-        # 2. Custom Port
+        # 2. 配置 WebSocket 服务端口
         default_port = getattr(cfg, "ws_port", 9999)
         port_input = input(f"🔌 请输入WebSocket服务端口 (当前默认: {default_port}): ").strip()
         if port_input:
@@ -49,7 +59,7 @@ def show_interactive_menu():
             except ValueError:
                 print(f"⚠️ 端口格式无效，将采用默认端口: {default_port}")
                 
-        # 3. Custom Camera Source
+        # 3. 配置视频源（摄像头编号 / 本地视频路径 / RTSP 流地址）
         default_source = cfg.camera_url
         source_input = input(f"🎥 请输入视频源 (0表示默认摄像头，或输入本地视频路径/RTSP流地址, 默认: '{default_source}'): ").strip()
         if source_input:
@@ -58,7 +68,7 @@ def show_interactive_menu():
             except ValueError:
                 cfg._cfg["camera_url"] = source_input
                 
-        # 4. Custom Camera ID
+        # 4. 配置摄像头 ID
         default_cam_id = cfg.camera_id
         cam_id_input = input(f"🆔 请输入摄像头ID (当前默认: {default_cam_id}): ").strip()
         if cam_id_input:
@@ -67,6 +77,7 @@ def show_interactive_menu():
             except ValueError:
                 print(f"⚠️ 摄像头ID格式无效，将采用默认ID: {default_cam_id}")
 
+    # 打印最终配置摘要，供用户确认
     print("\n" + "="*60)
     print("🚀 系统初始化配置完成，即将启动检测：")
     print(f"   📍 监控地点: {cfg.location}")
@@ -80,9 +91,12 @@ def show_interactive_menu():
 
 if __name__ == "__main__":
     try:
+        # 显示交互式菜单并获取用户配置
         cfg = show_interactive_menu()
+        # 创建火焰检测器实例并启动主循环
         detector = FlameDetector(cfg)
         detector.run()
     except KeyboardInterrupt:
+        # 用户通过 Ctrl+C 优雅终止
         print("\n检测任务已被用户终止。")
         sys.exit(0)
