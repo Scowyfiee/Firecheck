@@ -282,6 +282,12 @@ CREATE TABLE IF NOT EXISTS T_UserLoginLog (
         db.commit()
     except sqlite3.OperationalError:
         pass
+    # Force updating any camera ports still defaulting to 9999 or NULL to be distinct
+    try:
+        db.execute("UPDATE T_Camera SET WsPort = 9990 + Id WHERE WsPort IS NULL OR WsPort = 9999")
+        db.commit()
+    except Exception:
+        pass
     db.close()
     seed_data()  # 初始化完成后填充种子数据
 
@@ -364,17 +370,58 @@ def seed_data():
     db.execute("INSERT INTO T_Device (Id, MAC, Longitude, Latitude, Address, AreaId, ModelInfo, CreateTime, LastConnectTime) VALUES (1,'AAABBBCCCDDD','106.551556','29.563009','重庆理工大学花溪校区',1,'YOLOv11-Fire',?,?)", (now, now))
     db.execute("INSERT INTO T_Device (Id, MAC, Longitude, Latitude, Address, AreaId, ModelInfo, CreateTime, LastConnectTime) VALUES (2,'EEEFFFGGGHHH','106.542236','29.606703','重庆理工大学杨家坪校区',1,'YOLOv11-Fire',?,?)", (now, now))
 
-    # 插入示例摄像头
-    db.execute("INSERT INTO T_Camera (Id, IP, MAC, CameraUrl, Name, Longitude, Latitude, AreaId, Type, DeviceId, InstallTime) VALUES (1,'192.168.1.101','CAM:AA:BB:CC:01','rtsp://192.168.1.101:554/stream','花溪-教学楼A',?,?,1,'海康威视',1,?)",
-               ("106.551556", "29.563009", now))
-    db.execute("INSERT INTO T_Camera (Id, IP, MAC, CameraUrl, Name, Longitude, Latitude, AreaId, Type, DeviceId, InstallTime) VALUES (2,'192.168.1.102','CAM:AA:BB:CC:02','rtsp://192.168.1.102:554/stream','花溪-图书馆',?,?,1,'大华',1,?)",
-               ("106.552156", "29.564109", now))
-    db.execute("INSERT INTO T_Camera (Id, IP, MAC, CameraUrl, Name, Longitude, Latitude, AreaId, Type, DeviceId, InstallTime) VALUES (3,'192.168.1.201','CAM:AA:BB:CC:03','rtsp://192.168.1.201:554/stream','杨家坪-行政楼',?,?,1,'海康威视',2,?)",
-               ("106.542236", "29.606703", now))
+    # 填充摄像头故障和AI分析盒故障初始数据，满足系统故障展示要求
+    db.execute("INSERT INTO T_DeviceError (DeviceId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (1, 'AAABBBCCCDDD', ?, '算力异常', 'NPU核心温度 85℃，推理帧率降为 3 FPS，低于系统设定的 15 FPS 阈值')", (now,))
+    db.execute("INSERT INTO T_DeviceError (DeviceId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (1, 'AAABBBCCCDDD', ?, '算法崩溃', 'YOLOv11 推理线程异常退出 (exit status 139: segmentation fault)')", (now,))
+    db.execute("INSERT INTO T_CameraError (CameraId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (1, '127.0.0.1:9991', ?, '图像质量差', '视频源光照过低或被遮挡，图像置信度降至 25%')", (now,))
+    db.execute("INSERT INTO T_CameraError (CameraId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (2, '127.0.0.1:9992', ?, '网络故障', '网络延迟异常 (Ping > 500ms)，触发摄像头丢包故障')", (now,))
+
+    # 系统初始默认不预置任何摄像头，启动后将通过前端局域网 WebSocket 端口自动扫描和发现注册
 
     db.commit()
     db.close()
     logger.info("Database seeded with initial data")
+
+
+def check_and_log_faults(db):
+    """自适应在线/离线故障检测：检查 T_Device 表中设备的最后连接时间，
+    如果心跳超时超过 15 秒且设备为 'no' (未产生离线错误)，则自动生成离线记录。
+    """
+    try:
+        now = datetime.now()
+        threshold = (now - timedelta(seconds=15)).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 查找超时的在线设备
+        offline_devices = db.execute(
+            "SELECT * FROM T_Device WHERE LastConnectTime < ? AND AutoGenerateError = 'no'",
+            (threshold,)
+        ).fetchall()
+        
+        for dev in offline_devices:
+            dev_id = dev["Id"]
+            mac = dev["MAC"] or "unknown"
+            addr = dev["Address"] or "未知分析盒"
+            
+            # 记录分析盒故障日志
+            db.execute(
+                "INSERT INTO T_DeviceError (DeviceId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (?,?,?,?,?)",
+                (dev_id, mac, now_str, "设备离线", f"AI分析盒 [{addr}] 与云端失去心跳连接 (超时超过15秒)")
+            )
+            
+            # 查找该分析盒下的摄像头并记录故障
+            cameras = db.execute("SELECT * FROM T_Camera WHERE DeviceId = ?", (dev_id,)).fetchall()
+            for cam in cameras:
+                db.execute(
+                    "INSERT INTO T_CameraError (CameraId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (?,?,?,?,?)",
+                    (cam["Id"], f"Port:{cam['WsPort']}", now_str, "设备离线", f"监控流中断 (AI分析盒离线)")
+                )
+                
+            # 标记为已处理错误，避免重复产生
+            db.execute("UPDATE T_Device SET AutoGenerateError = 'yes' WHERE Id = ?", (dev_id,))
+        db.commit()
+    except Exception as e:
+        logger.error(f"check_and_log_faults error: {e}")
 
 
 # --- 认证与授权装饰器及辅助函数 ---
@@ -498,6 +545,7 @@ def dashboard():
     """
     user = get_current_user()
     db = get_db()
+    check_and_log_faults(db)
 
     # 全局统计：总报警数、待处理数、设备总数
     total_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult").fetchone()["c"]
@@ -530,7 +578,7 @@ def dashboard():
 
     # 各区域月度报警排名（Top 5）
     monthly_ranking = [dict(r) for r in db.execute(
-        "SELECT COALESCE(a.Name,'?') as name, COUNT(*) as count FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id WHERE dr.CreatTime > ? GROUP BY a.Id ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
+        "SELECT COALESCE(NULLIF(dr.Location, ''), '未知区域') as name, COUNT(*) as count FROM T_DetectResult dr WHERE dr.CreatTime > ? GROUP BY dr.Location ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
     max_rank = max([r["count"] for r in monthly_ranking]) if monthly_ranking else 1  # 排名中的最大值，用于进度条比例
 
     # 所有摄像头列表（用于地图标注）
@@ -845,6 +893,18 @@ def device_list():
     db = get_db()
     devices = [dict(r) for r in db.execute(
         "SELECT d.*, a.Name as AreaName FROM T_Device d LEFT JOIN T_Area a ON d.AreaId=a.Id ORDER BY d.Id").fetchall()]
+    
+    now = datetime.now()
+    for d in devices:
+        if d.get("LastConnectTime"):
+            try:
+                lct = datetime.strptime(d["LastConnectTime"], "%Y-%m-%d %H:%M:%S")
+                d["status"] = "online" if (now - lct).total_seconds() <= 15 else "offline"
+            except Exception:
+                d["status"] = "offline"
+        else:
+            d["status"] = "offline"
+            
     areas = [dict(r) for r in db.execute("SELECT Id,Value as Name FROM T_Dictionary WHERE Key='AreaType'").fetchall()]
     return render_template_string(DEVICE_TEMPLATE, user=get_current_user(), devices=devices, areas=areas)
 
@@ -914,7 +974,19 @@ def camera_list():
     """摄像头列表页面：联表查询摄像头及关联的设备、区域信息。"""
     db = get_db()
     cameras = [dict(r) for r in db.execute(
-        "SELECT c.*, a.Name as AreaName, d.MAC as DeviceMAC, d.Address as DeviceAddress FROM T_Camera c LEFT JOIN T_Area a ON c.AreaId=a.Id LEFT JOIN T_Device d ON c.DeviceId=d.Id ORDER BY c.Id").fetchall()]
+        "SELECT c.*, a.Name as AreaName, d.MAC as DeviceMAC, d.Address as DeviceAddress, d.LastConnectTime FROM T_Camera c LEFT JOIN T_Area a ON c.AreaId=a.Id LEFT JOIN T_Device d ON c.DeviceId=d.Id ORDER BY c.Id").fetchall()]
+    
+    now = datetime.now()
+    for c in cameras:
+        if c.get("LastConnectTime"):
+            try:
+                lct = datetime.strptime(c["LastConnectTime"], "%Y-%m-%d %H:%M:%S")
+                c["status"] = "online" if (now - lct).total_seconds() <= 15 else "offline"
+            except Exception:
+                c["status"] = "offline"
+        else:
+            c["status"] = "offline"
+
     areas = [dict(r) for r in db.execute("SELECT Id,Value as Name FROM T_Dictionary WHERE Key='AreaType'").fetchall()]
     devices = [dict(r) for r in db.execute("SELECT * FROM T_Device").fetchall()]
     return render_template_string(CAMERA_TEMPLATE, user=get_current_user(), cameras=cameras, areas=areas, devices=devices)
@@ -1102,6 +1174,36 @@ def audit_reject(aid):
     return redirect(url_for("audit_list"))
 
 
+@app.route("/admin/simulate_error", methods=["POST"])
+@login_required
+def simulate_error():
+    """模拟故障发生：往故障日志表手动写入一条模拟故障。"""
+    try:
+        data = request.get_json()
+        error_type = data.get("type") # "device" or "camera"
+        target_id = int(data.get("id", 1))
+        error_code = data.get("code", "算力异常")
+        error_msg = data.get("msg", "模拟异常测试日志")
+        
+        db = get_db()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if error_type == "device":
+            dev = db.execute("SELECT * FROM T_Device WHERE Id=?", (target_id,)).fetchone()
+            mac = dev["MAC"] if dev else "unknown"
+            db.execute("INSERT INTO T_DeviceError (DeviceId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (?,?,?,?,?)",
+                       (target_id, mac, now_str, error_code, error_msg))
+        else:
+            cam = db.execute("SELECT * FROM T_Camera WHERE Id=?", (target_id,)).fetchone()
+            mac = f"Port:{cam['WsPort']}" if cam else "unknown"
+            db.execute("INSERT INTO T_CameraError (CameraId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (?,?,?,?,?)",
+                       (target_id, mac, now_str, error_code, error_msg))
+        db.commit()
+        return jsonify({"code": 200, "msg": "故障模拟成功，已记录至运维日志！"})
+    except Exception as e:
+        return jsonify({"code": 500, "msg": str(e)}), 500
+
+
 # --- 路由：摄像头错误日志 ---
 
 @app.route("/admin/camera_error")
@@ -1109,6 +1211,7 @@ def audit_reject(aid):
 def camera_error_list():
     """摄像头错误日志列表页面：联表查询摄像头名称，按时间降序展示。"""
     db = get_db()
+    check_and_log_faults(db)
     errors = [dict(r) for r in db.execute(
         "SELECT ce.*, c.Name as CameraName FROM T_CameraError ce LEFT JOIN T_Camera c ON ce.CameraId=c.Id ORDER BY ce.CreateTime DESC").fetchall()]
     return render_template_string(CAMERA_ERROR_TEMPLATE, user=get_current_user(), errors=errors)
@@ -1121,6 +1224,7 @@ def camera_error_list():
 def device_error_list():
     """设备错误日志列表页面：联表查询设备地址和 MAC，按时间降序展示。"""
     db = get_db()
+    check_and_log_faults(db)
     errors = [dict(r) for r in db.execute(
         "SELECT de.*, d.Address as DeviceAddress, d.MAC as DeviceMAC FROM T_DeviceError de LEFT JOIN T_Device d ON de.DeviceId=d.Id ORDER BY de.CreateTime DESC").fetchall()]
     return render_template_string(DEVICE_ERROR_TEMPLATE, user=get_current_user(), errors=errors)
@@ -1282,17 +1386,92 @@ def api_device_error():
         return jsonify({"code": 500, "msg": str(e)}), 500
 
 
+@app.route("/api/camera/discover", methods=["POST"])
+def api_camera_discover():
+    """动态发现并注册摄像头接口：接收前端扫描发现的摄像头元数据并注册到 T_Camera 表中。
+    
+    Returns:
+        JSON: {"code": 200, "msg": "ok"} 或错误信息
+    """
+    try:
+        data = request.get_json() or {}
+        camera_id = int(data.get("camera_id", 1))
+        ws_port = int(data.get("ws_port", 9999))
+        camera_ip = data.get("ip", "127.0.0.1")
+        location = data.get("location", "未知位置")
+        camera_name = data.get("camera_name", f"摄像头 {camera_id}")
+        
+        db = get_db()
+        existing = db.execute("SELECT * FROM T_Camera WHERE Id = ?", (camera_id,)).fetchone()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if existing:
+            db.execute("UPDATE T_Camera SET WsPort = ?, IP = ?, CameraUrl = 'ws://'||?||':'||?, Name = ?, InstallTime = ? WHERE Id = ?",
+                       (ws_port, camera_ip, camera_ip, ws_port, camera_name, now, camera_id))
+        else:
+            lat_offset = (camera_id % 3) * 0.001
+            lng_offset = (camera_id % 2) * 0.001
+            lat = f"{29.563009 + lat_offset:.6f}"
+            lng = f"{106.551556 + lng_offset:.6f}"
+            db.execute("""INSERT INTO T_Camera (Id, IP, MAC, CameraUrl, Name, Longitude, Latitude, AreaId, Type, DeviceId, InstallTime, WsPort)
+                          VALUES (?, ?, ?, 'ws://'||?||':'||?, ?, ?, ?, 1, '发现设备', 1, ?, ?)""",
+                       (camera_id, camera_ip, f"DISC:CAM:{camera_id}", camera_ip, ws_port, camera_name, lng, lat, now, ws_port))
+        
+        db.commit()
+        return jsonify({"code": 200, "msg": "ok"})
+    except Exception as e:
+        logger.error(f"Discover camera error: {e}")
+        return jsonify({"code": 500, "msg": str(e)}), 500
+
+
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
     """提供上传文件的静态访问，如截图、录像、Logo 等。
-    
-    Args:
-        filename: 相对于 uploads 目录的文件路径
-        
-    Returns:
-        Flask 文件响应
+    支持 HTTP Range 请求以确保视频在 Chrome/Safari 中能自由拖动和播放。
     """
-    return send_from_directory(str(UPLOAD_DIR), filename)
+    import re
+    from flask import Response, abort
+    
+    filepath = UPLOAD_DIR / filename
+    if not filepath.exists():
+        return abort(404)
+
+    # 针对非视频文件，直接使用 send_from_directory
+    if not filename.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
+        return send_from_directory(str(UPLOAD_DIR), filename)
+
+    # 提供 206 Partial Content Range 拖动支持
+    file_size = filepath.stat().st_size
+    range_header = request.headers.get("Range", None)
+    if not range_header:
+        return send_from_directory(str(UPLOAD_DIR), filename)
+
+    byte1, byte2 = 0, None
+    m = re.search(r"bytes=(\d+)-(\d*)", range_header)
+    if m:
+        g = m.groups()
+        if g[0]:
+            byte1 = int(g[0])
+        if g[1]:
+            byte2 = int(g[1])
+
+    length = file_size - byte1
+    if byte2 is not None and byte2 != "":
+        try:
+            byte2_val = int(byte2)
+            length = byte2_val - byte1 + 1
+        except ValueError:
+            pass
+
+    data = None
+    with open(filepath, "rb") as f:
+        f.seek(byte1)
+        data = f.read(length)
+
+    rv = Response(data, 206, mimetype="video/mp4", direct_passthrough=True)
+    rv.headers.add("Content-Range", f"bytes {byte1}-{byte1 + len(data) - 1}/{file_size}")
+    rv.headers.add("Accept-Ranges", "bytes")
+    return rv
 
 
 @app.route("/api/stats")
@@ -1306,6 +1485,7 @@ def api_stats():
         JSON: 包含所有统计数据的字典
     """
     db = get_db()
+    check_and_log_faults(db)
     # 各区域报警数量分布（用于地图热力图/柱状图）
     area = [dict(r) for r in db.execute(
         "SELECT a.Name as name, COUNT(dr.Id) as value FROM T_Area a LEFT JOIN T_DetectResult dr ON a.Id=dr.AreaId GROUP BY a.Id").fetchall()]
@@ -1341,7 +1521,7 @@ def api_stats():
 
     # 月度区域报警排名（Top 5）
     monthly_ranking = [dict(r) for r in db.execute(
-        "SELECT COALESCE(a.Name,'?') as name, COUNT(*) as count FROM T_DetectResult dr LEFT JOIN T_Area a ON dr.AreaId=a.Id WHERE dr.CreatTime > ? GROUP BY a.Id ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
+        "SELECT COALESCE(NULLIF(dr.Location, ''), '未知区域') as name, COUNT(*) as count FROM T_DetectResult dr WHERE dr.CreatTime > ? GROUP BY dr.Location ORDER BY count DESC LIMIT 5", (month_ago,)).fetchall()]
     max_rank = max([r["count"] for r in monthly_ranking]) if monthly_ranking else 1
 
     return jsonify({
@@ -1511,13 +1691,74 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     }
     .scrollbar-thin::-webkit-scrollbar { width: 4px; height: 4px; }
     .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
-    .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 2px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 2px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+    
+    /* Smooth modern glassmorphism panels with transition effects */
     .glass-panel {
       background: rgba(15, 23, 42, 0.45);
       backdrop-filter: blur(12px);
       -webkit-backdrop-filter: blur(12px);
       border: 1px solid rgba(255, 255, 255, 0.06);
+      transition: border-color 0.3s ease, box-shadow 0.3s ease, background-color 0.3s ease, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     }
+    .glass-panel:hover {
+      border-color: rgba(34, 211, 238, 0.2);
+      box-shadow: 0 10px 30px -10px rgba(6, 182, 212, 0.12), 0 1px 1px rgba(255, 255, 255, 0.05) inset;
+      background: rgba(15, 23, 42, 0.55);
+    }
+    
+    /* Micro-scale animations for hover states */
+    .hover-scale {
+      transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.2s ease, filter 0.2s ease;
+    }
+    .hover-scale:hover {
+      transform: scale(1.02);
+      filter: brightness(1.1);
+    }
+    .hover-scale:active {
+      transform: scale(0.98);
+    }
+    
+    /* Slide in up animation for timeline entries and charts */
+    @keyframes slideInUp {
+      from { opacity: 0; transform: translateY(16px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .timeline-item-anim {
+      animation: slideInUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    
+    /* Scanning effect for stream screen */
+    @keyframes scanning {
+      0% { top: 0%; opacity: 0.1; }
+      50% { opacity: 0.8; }
+      100% { top: 100%; opacity: 0.1; }
+    }
+    .scan-line {
+      position: absolute;
+      width: 100%;
+      height: 3px;
+      background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.7), transparent);
+      animation: scanning 3s infinite linear;
+      pointer-events: none;
+    }
+
+    /* Pulse effect for status points */
+    @keyframes radarPulse {
+      0% { transform: scale(0.9); opacity: 0.8; }
+      50% { opacity: 0.4; }
+      100% { transform: scale(1.6); opacity: 0; }
+    }
+    .radar-pulse {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background-color: currentColor;
+      animation: radarPulse 2s infinite ease-out;
+    }
+    
     @keyframes fadeIn {
       from { opacity: 0; }
       to { opacity: 1; }
@@ -1563,21 +1804,25 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <div class="flex-1 overflow-y-auto pr-1 flex flex-col gap-2 text-xs scrollbar-thin" id="timelineContainer">
       <div class="relative border-l border-slate-800 ml-2 pl-4 flex flex-col gap-3 py-2" id="timelineList">
         {% for a in recent_alarms %}
-        <div class="relative mb-2">
+        <div class="relative mb-2 timeline-item-anim">
           <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-slate-950 flex items-center justify-center
             {% if a.Status == '1' %} border-rose-500 shadow-[0_0_6px_#f43f5e]
             {% elif a.OperateResult == '误报无需处理' %} border-emerald-500 shadow-[0_0_6px_#10b981]
             {% elif a.OperateResult == '漏报记录' %} border-amber-500 shadow-[0_0_6px_#f59e0b]
             {% else %} border-blue-500 shadow-[0_0_6px_#3b82f6]
             {% endif %}">
-            <span class="w-1.5 h-1.5 rounded-full
-              {% if a.Status == '1' %} bg-rose-500 animate-pulse
-              {% elif a.OperateResult == '误报无需处理' %} bg-emerald-500
-              {% elif a.OperateResult == '漏报记录' %} bg-amber-500 animate-pulse
-              {% else %} bg-blue-500
-              {% endif %}"></span>
+            <span class="w-1.5 h-1.5 rounded-full relative flex
+              {% if a.Status == '1' %} text-rose-500 bg-rose-500
+              {% elif a.OperateResult == '误报无需处理' %} text-emerald-500 bg-emerald-500
+              {% elif a.OperateResult == '漏报记录' %} text-amber-500 bg-amber-500
+              {% else %} text-blue-500 bg-blue-500
+              {% endif %}">
+              {% if a.Status == '1' or a.OperateResult == '漏报记录' %}
+              <span class="radar-pulse"></span>
+              {% endif %}
+            </span>
           </span>
-          <div class="bg-slate-950/25 border border-slate-800 rounded-xl p-3 flex flex-col gap-1 transition duration-200 cursor-pointer hover:border-cyan-500/40 hover:bg-slate-950/40" onclick="showAlarmDetail({{ a.Id }})">
+          <div class="glass-panel hover-scale rounded-xl p-3 flex flex-col gap-1 cursor-pointer" onclick="showAlarmDetail({{ a.Id }})">
             <div class="flex justify-between items-center">
               <span class="text-rose-400 font-semibold text-[10px]">{% if a.Description and '烟雾' in a.Description and '火焰' not in a.Description %}烟雾预警{% else %}火焰预警{% endif %} {% if a.Confidence %}({{ (a.Confidence*100)|round(1) }}%){% endif %}</span>
               {% if a.Status == '1' %}
@@ -1617,23 +1862,50 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         实时监控画面
       </h2>
       <div class="flex items-center gap-2">
+        <span class="text-[9px] text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded border border-slate-800 flex items-center gap-1">
+          IP: <input type="text" id="scanHost" value="0.0.0.0" class="w-20 bg-transparent text-cyan-400 text-center font-mono focus:outline-none">
+        </span>
+        <span class="text-[9px] text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded border border-slate-800 flex items-center gap-1">
+          端口: <input type="number" id="scanStart" value="9991" class="w-8 bg-transparent text-cyan-400 text-center font-mono focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"> - <input type="number" id="scanEnd" value="9994" class="w-8 bg-transparent text-cyan-400 text-center font-mono focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none">
+        </span>
+        <span class="text-[9px] text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded border border-slate-800 flex items-center gap-1">
+          间隔: <input type="number" id="scanIntervalInput" value="1" class="w-4 bg-transparent text-cyan-400 text-center font-mono focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none">秒
+        </span>
+        <button onclick="triggerDefaultScan()" class="text-[9px] bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 px-2 py-0.5 rounded transition active:scale-95 font-semibold">默认扫描</button>
+        <button onclick="triggerManualScan()" class="text-[9px] bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 px-2 py-0.5 rounded transition active:scale-95 font-semibold">手动扫描</button>
         <select id="cameraSelector" onchange="changeCameraStream()" class="bg-slate-950/50 border border-slate-800 rounded px-2 py-0.5 text-slate-300 focus:outline-none focus:border-cyan-500/50 transition text-[10px] font-semibold">
-          {% for c in cameras %}
-          <option value="{{ c.Id }}" data-port="{{ c.WsPort or 9999 }}">{{ c.Name }} (Port {{ c.WsPort or 9999 }})</option>
-          {% else %}
-          <option value="1" data-port="9999">默认相机 (Port 9999)</option>
-          {% endfor %}
+          <option value="" disabled selected>🔍 正在检索监控...</option>
         </select>
         <span class="text-[9px] text-slate-400 bg-slate-950/50 px-3 py-0.5 rounded-full border border-slate-800">1280x720 | WebSocket</span>
       </div>
     </div>
     <div class="flex-1 bg-slate-950/60 rounded-xl relative overflow-hidden flex items-center justify-center tech-grid-diagonal border border-slate-900 shadow-inner">
+      <div class="scan-line"></div>
       <img id="cameraFrame" class="hidden absolute inset-0 w-full h-full object-contain">
-      <div id="videoOffline" class="flex flex-col items-center gap-2.5 z-10 text-center">
-        <svg class="w-12 h-12 text-slate-600 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
-        </svg>
-        <span class="text-slate-400 text-xs font-semibold tracking-wider">视频流未连接 (Camera Offline)</span>
+      <div id="videoOffline" class="flex flex-col items-center gap-4 z-10 text-center p-6 bg-slate-950/40 rounded-2xl border border-slate-900/60 shadow-xl max-w-sm">
+        <div class="relative flex items-center justify-center w-20 h-20 bg-slate-950/80 rounded-full border border-slate-800 shadow-inner">
+          <div class="absolute inset-0 rounded-full border border-cyan-500/20 animate-ping opacity-60"></div>
+          <div class="absolute inset-2 rounded-full border border-cyan-500/10 animate-pulse"></div>
+          <svg class="w-10 h-10 text-cyan-400/90 animate-bounce" fill="none" stroke="currentColor" stroke-width="1.2" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+            <!-- Satellite solar panels -->
+            <rect x="2" y="10" width="4" height="6" rx="0.5" fill="rgba(6,182,212,0.1)"></rect>
+            <line x1="6" y1="13" x2="9" y2="13"></line>
+            <rect x="18" y="10" width="4" height="6" rx="0.5" fill="rgba(6,182,212,0.1)"></rect>
+            <line x1="15" y1="13" x2="18" y2="13"></line>
+            <!-- Satellite main body -->
+            <rect x="9" y="8" width="6" height="10" rx="1" fill="rgba(6,182,212,0.2)"></rect>
+            <!-- Antenna dish -->
+            <path d="M12 18v2M10 20h4"></path>
+            <!-- Signal transmission waves -->
+            <path d="M8 22c2-1 6-1 8 0" class="animate-pulse"></path>
+            <!-- Details on satellite -->
+            <circle cx="12" cy="11" r="1.5" fill="currentColor"></circle>
+          </svg>
+        </div>
+        <div class="flex flex-col gap-1">
+          <span class="text-cyan-400 text-xs font-bold tracking-widest uppercase">无信号连接 (No Signal)</span>
+          <span class="text-slate-500 text-[10px] max-w-[200px]">未检测到活跃的摄像头网络流</span>
+        </div>
       </div>
       <span id="videoTag" class="hidden absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-455 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md">Offline</span>
     </div>
@@ -1779,63 +2051,289 @@ function upd(){
 upd();
 setInterval(upd,1000);
 
-// WebSocket connection for live camera stream
+// WebSocket connection and Dynamic Discovery Port Scanner
 var ws=null,wsReconnectTimer=null,wsReconnectDelay=1000;
-function wsConnect(){
+var discoveredCameras = {}; // camera_id -> {id, name, port, location, host}
+var scanningIntervalId = null;
+
+// Do not pre-populate from database to ensure a clean slate 0-device start.
+// Devices will only appear once successfully discovered and connected via the port scanner.
+
+// Initialize Scanner on load
+function initScanner() {
+  updateCameraSelectorUI();
+  
+  const scanIntervalSec = parseInt(document.getElementById('scanIntervalInput').value) || 1;
+  if (scanningIntervalId) clearInterval(scanningIntervalId);
+  
+  // Perform initial scan
+  scanActivePorts();
+  
+  // Schedule scanning
+  scanningIntervalId = setInterval(scanActivePorts, scanIntervalSec * 1000);
+}
+
+function triggerDefaultScan() {
+  console.log('[Scanner] Starting default scan on 0.0.0.0...');
+  scanActivePorts('0.0.0.0');
+}
+
+function triggerManualScan() {
+  const host = document.getElementById('scanHost').value.trim() || '0.0.0.0';
+  console.log('[Scanner] Starting manual scan on IP:', host);
+  scanActivePorts(host);
+}
+
+function scanActivePorts(targetHost) {
+  const defaultHost = document.getElementById('scanHost').value.trim() || '0.0.0.0';
+  const hostToScan = targetHost || defaultHost;
+  
+  const start = parseInt(document.getElementById('scanStart').value) || 9991;
+  const end = parseInt(document.getElementById('scanEnd').value) || 9994;
+  
+  for (let port = start; port <= end; port++) {
+    if (isPortBeingUsed(hostToScan, port)) continue;
+    checkPortWS(hostToScan, port);
+  }
+}
+
+function isPortBeingUsed(host, port) {
+  const selector = document.getElementById('cameraSelector');
+  if (selector && selector.selectedIndex >= 0) {
+    const activePort = parseInt(selector.options[selector.selectedIndex].getAttribute('data-port'));
+    const activeHost = selector.options[selector.selectedIndex].getAttribute('data-host') || '127.0.0.1';
+    if (activePort === port && activeHost === host && ws && ws.readyState === WebSocket.OPEN) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function checkPortWS(host, port) {
+  const testUrl = 'ws://' + host + ':' + port;
+  const socket = new WebSocket(testUrl);
+  
+  const timeoutId = setTimeout(() => {
+    if (socket.readyState !== WebSocket.OPEN) {
+      socket.close();
+    }
+  }, 1200);
+
+  socket.onopen = function() {
+    clearTimeout(timeoutId);
+  };
+
+  socket.onmessage = function(event) {
+    clearTimeout(timeoutId);
+    if (typeof event.data === 'string') {
+      try {
+        const info = JSON.parse(event.data);
+        if (info.type === 'camera_info') {
+          console.log('[Scanner] Discovered camera:', info);
+          registerDiscoveredCamera(info, host);
+          socket.close();
+        }
+      } catch (err) {
+        socket.close();
+      }
+    } else {
+      socket.close();
+    }
+  };
+
+  socket.onerror = function() {
+    clearTimeout(timeoutId);
+  };
+
+  socket.onclose = function() {
+    clearTimeout(timeoutId);
+  };
+}
+
+function registerDiscoveredCamera(info, host) {
+  const camId = info.camera_id;
+  const camName = info.camera_name;
+  const port = info.ws_port;
+  const loc = info.location;
+
+  const existing = discoveredCameras[camId];
+  if (existing && existing.port === port && existing.host === host && existing.name === camName && existing.location === loc) {
+    if (scanningIntervalId) {
+      console.log('[Scanner] Camera already exists. Stopping auto-scanning interval.');
+      clearInterval(scanningIntervalId);
+      scanningIntervalId = null;
+    }
+    return;
+  }
+
+  discoveredCameras[camId] = {
+    id: camId,
+    name: camName,
+    port: port,
+    location: loc,
+    host: host
+  };
+
+  fetch('/api/camera/discover', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      camera_id: camId,
+      ws_port: port,
+      ip: host,
+      location: loc,
+      camera_name: camName
+    })
+  })
+  .then(res => res.json())
+  .then(data => {
+    console.log('[Scanner] Camera registered on server:', data);
+    updateCameraSelectorUI(camId);
+    
+    if (scanningIntervalId) {
+      console.log('[Scanner] Camera successfully registered. Stopping auto-scanning interval.');
+      clearInterval(scanningIntervalId);
+      scanningIntervalId = null;
+    }
+  })
+  .catch(err => console.error('[Scanner] Failed to register camera:', err));
+}
+
+function updateCameraSelectorUI(selectedId) {
+  const selector = document.getElementById('cameraSelector');
+  if (!selector) return;
+
+  const currentSelection = selector.value;
+  selector.innerHTML = '';
+
+  const cameraKeys = Object.keys(discoveredCameras);
+  if (cameraKeys.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = "";
+    opt.textContent = "🔍 正在检索监控...";
+    opt.disabled = true;
+    opt.selected = true;
+    selector.appendChild(opt);
+    return;
+  }
+
+  cameraKeys.forEach(id => {
+    const cam = discoveredCameras[id];
+    const opt = document.createElement('option');
+    opt.value = cam.id;
+    opt.setAttribute('data-port', cam.port);
+    opt.setAttribute('data-host', cam.host || '127.0.0.1');
+    if (cam.name === cam.location || !cam.location) {
+      opt.textContent = `${cam.name} (Port ${cam.port})`;
+    } else {
+      opt.textContent = `${cam.name} (${cam.location} - Port ${cam.port})`;
+    }
+    selector.appendChild(opt);
+  });
+
+  if (discoveredCameras[currentSelection]) {
+    selector.value = currentSelection;
+  } else if (selectedId && discoveredCameras[selectedId]) {
+    selector.value = selectedId;
+    changeCameraStream();
+  } else {
+    selector.selectedIndex = 0;
+    changeCameraStream();
+  }
+}
+
+function wsConnect() {
   if(wsReconnectTimer){clearTimeout(wsReconnectTimer); wsReconnectTimer=null;}
   if(ws){try{ws.close();}catch(e){}}
-  
-  const host = location.hostname || '127.0.0.1';
-  let port = '9999';
+
   const selector = document.getElementById('cameraSelector');
-  if(selector && selector.selectedIndex >= 0) {
-    port = selector.options[selector.selectedIndex].getAttribute('data-port') || '9999';
+  if(!selector || selector.selectedIndex < 0 || !selector.value) {
+    document.getElementById('videoOffline').style.display='flex';
+    document.getElementById('cameraFrame').classList.add('hidden');
+    var t=document.getElementById('videoTag');
+    if (t) {
+      t.classList.remove('hidden');
+      t.textContent='No Signal';
+      t.className='absolute top-3 left-3 bg-slate-500/10 border border-slate-500/20 text-slate-400 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
+    }
+    return;
   }
+
+  const host = selector.options[selector.selectedIndex].getAttribute('data-host') || location.hostname || '127.0.0.1';
+  const port = selector.options[selector.selectedIndex].getAttribute('data-port') || '9999';
   const wsUrl = 'ws://' + host + ':' + port;
-  
-  console.log('[WS] Connecting to: ' + wsUrl);
+
+  console.log('[WS] Connecting stream to: ' + wsUrl);
   ws=new WebSocket(wsUrl);
   ws.binaryType='blob';
-  
+
   ws.onopen=function(){
-    console.log('[WS] Connected to ' + wsUrl);
+    console.log('[WS] Stream connected: ' + wsUrl);
     document.getElementById('videoOffline').style.display='none';
     document.getElementById('cameraFrame').classList.remove('hidden');
     var t=document.getElementById('videoTag');
-    t.classList.remove('hidden');
-    t.textContent='Live';
-    t.className='absolute top-3 left-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
+    if (t) {
+      t.classList.remove('hidden');
+      t.textContent='Live';
+      t.className='absolute top-3 left-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
+    }
     wsReconnectDelay=1000;
+    
+    if (scanningIntervalId) {
+      console.log('[WS] Stream connected. Stopping auto-scanning interval.');
+      clearInterval(scanningIntervalId);
+      scanningIntervalId = null;
+    }
   };
-  
+
   ws.onmessage=function(e){
+    if (typeof e.data === 'string') {
+      try {
+        const info = JSON.parse(e.data);
+        if (info.type === 'camera_info') {
+          console.log('[WS] Stream info handshake:', info);
+          registerDiscoveredCamera(info);
+        }
+      } catch(err) {
+        console.error('[WS] Parse message error:', err);
+      }
+      return;
+    }
+
     var u=URL.createObjectURL(e.data);
     var img=document.getElementById('cameraFrame');
     img.onload=function(){URL.revokeObjectURL(u);};
     img.src=u;
   };
-  
+
   ws.onclose=function(e){
-    console.log('[WS] Closed. Code:', e.code);
+    console.log('[WS] Stream closed. Code:', e.code);
     document.getElementById('videoOffline').style.display='flex';
     document.getElementById('cameraFrame').classList.add('hidden');
     var t=document.getElementById('videoTag');
-    t.classList.remove('hidden');
-    t.textContent='Offline';
-    t.className='absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-455 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
-    
+    if (t) {
+      t.classList.remove('hidden');
+      t.textContent='Offline';
+      t.className='absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-455 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md';
+    }
+
     wsReconnectTimer=setTimeout(wsConnect, wsReconnectDelay);
     wsReconnectDelay=Math.min(wsReconnectDelay*2, 10000);
   };
-  
+
   ws.onerror=function(e){
-    console.error('[WS] Error observed:', e);
+    console.error('[WS] Stream error observed:', e);
   };
 }
+
 function changeCameraStream(){
   wsReconnectDelay=1000;
   wsConnect();
 }
+
+document.getElementById('scanIntervalInput').addEventListener('change', initScanner);
+
+initScanner();
 wsConnect();
 
 // Search / Query & Interactive Filtering functionality
@@ -1862,16 +2360,16 @@ document.addEventListener("DOMContentLoaded", function() {
   const locInput = document.getElementById('searchLocation');
   
   if (startInput) {
-    startInput.value = formatDateTimeLocal(earliestAlarmTime);
-    filterStart = startInput.value;
+    startInput.value = '';
+    filterStart = '';
     startInput.addEventListener('change', function() {
       filterStart = this.value;
       fetchRealtimeData();
     });
   }
   if (endInput) {
-    endInput.value = getNowDateTimeLocal();
-    filterEnd = endInput.value;
+    endInput.value = '';
+    filterEnd = '';
     endInput.addEventListener('change', function() {
       filterEnd = this.value;
       fetchRealtimeData();
@@ -2114,6 +2612,7 @@ function showAlarmDetail(id) {
     if (a.videoUrl) {
       video.src = a.videoUrl;
       video.load();
+      video.play().catch(e => console.log("Video play failed:", e));
       video.classList.remove('hidden');
       noVideo.classList.add('hidden');
     } else {
@@ -2281,10 +2780,12 @@ function fetchRealtimeData() {
             let dotBorderClass = 'border-rose-500 shadow-[0_0_6px_#f43f5e]';
             let dotBgClass = 'bg-rose-500 animate-pulse';
             let statusBadge = '<span class="text-[8px] bg-rose-500/10 text-rose-400 border border-rose-500/20 px-1.5 py-0.5 rounded font-bold">待处理</span>';
+            let pulseHtml = '';
             
             if (a.Status === '1') {
               dotBorderClass = 'border-rose-500 shadow-[0_0_6px_#f43f5e]';
-              dotBgClass = 'bg-rose-500 animate-pulse';
+              dotBgClass = 'bg-rose-500 text-rose-500';
+              pulseHtml = '<span class="radar-pulse"></span>';
               statusBadge = '<span class="text-[8px] bg-rose-500/10 text-rose-400 border border-rose-500/20 px-1.5 py-0.5 rounded font-bold">待处理</span>';
             } else if (a.OperateResult === '误报无需处理') {
               dotBorderClass = 'border-emerald-500 shadow-[0_0_6px_#10b981]';
@@ -2292,7 +2793,8 @@ function fetchRealtimeData() {
               statusBadge = '<span class="text-[8px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/35 px-1.5 py-0.5 rounded font-bold">排除误报</span>';
             } else if (a.OperateResult === '漏报记录') {
               dotBorderClass = 'border-amber-500 shadow-[0_0_6px_#f59e0b]';
-              dotBgClass = 'bg-amber-500 animate-pulse';
+              dotBgClass = 'bg-amber-500 text-amber-500';
+              pulseHtml = '<span class="radar-pulse"></span>';
               statusBadge = '<span class="text-[8px] bg-amber-500/15 text-amber-400 border border-amber-500/35 px-1.5 py-0.5 rounded font-bold animate-pulse">漏报记录</span>';
             } else {
               dotBorderClass = 'border-blue-500 shadow-[0_0_6px_#3b82f6]';
@@ -2303,11 +2805,13 @@ function fetchRealtimeData() {
             const typeName = (a.Description && a.Description.includes('烟雾') && !a.Description.includes('火焰')) ? '烟雾预警' : '火焰预警';
 
             timelineHtml += `
-            <div class="relative mb-2">
+            <div class="relative mb-2 timeline-item-anim">
               <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-slate-950 flex items-center justify-center ${dotBorderClass}">
-                <span class="w-1.5 h-1.5 rounded-full ${dotBgClass}"></span>
+                <span class="w-1.5 h-1.5 rounded-full relative flex ${dotBgClass}">
+                  ${pulseHtml}
+                </span>
               </span>
-              <div class="bg-slate-950/25 border border-slate-800 rounded-xl p-3 flex flex-col gap-1 transition duration-200 cursor-pointer hover:border-cyan-500/40 hover:bg-slate-950/40" onclick="showAlarmDetail(${a.Id})">
+              <div class="glass-panel hover-scale rounded-xl p-3 flex flex-col gap-1 cursor-pointer" onclick="showAlarmDetail(${a.Id})">
                 <div class="flex justify-between items-center">
                   <span class="text-rose-400 font-semibold text-[10px]">${typeName} ${confBadge}</span>
                   ${statusBadge}
@@ -2425,6 +2929,29 @@ document.addEventListener("DOMContentLoaded", function() {
   
   fetchRealtimeData();
   setInterval(fetchRealtimeData, 2000);
+
+  // Intercept alarm form submit to prevent page reload and protect stream
+  const modalForm = document.getElementById('modalProcessForm');
+  if (modalForm) {
+    modalForm.addEventListener('submit', function(e) {
+      e.preventDefault();
+      const form = this;
+      const formData = new FormData(form);
+      fetch(form.action, {
+        method: 'POST',
+        body: formData
+      })
+      .then(res => {
+        closeAlarmDetail();
+        fetchRealtimeData();
+      })
+      .catch(err => {
+        console.error('Failed to submit alarm process form:', err);
+        closeAlarmDetail();
+        fetchRealtimeData();
+      });
+    });
+  }
 });
 </script>
 
@@ -3291,6 +3818,7 @@ DEVICE_TEMPLATE = make_admin_template("AI分析盒管理", """
           <th class="px-4 py-3">MAC地址</th>
           <th class="px-4 py-3">物理位置</th>
           <th class="px-4 py-3">所属区域</th>
+          <th class="px-4 py-3">在线状态</th>
           <th class="px-4 py-3">模型版本</th>
           <th class="px-4 py-3">最后通信时间</th>
           <th class="px-4 py-3">操作</th>
@@ -3303,16 +3831,30 @@ DEVICE_TEMPLATE = make_admin_template("AI分析盒管理", """
           <td class="px-4 py-3.5 text-slate-200 font-medium font-mono">{{ d.MAC }}</td>
           <td class="px-4 py-3.5 text-slate-300">{{ d.Address or '--' }}</td>
           <td class="px-4 py-3.5 text-slate-400">{{ d.AreaName or '--' }}</td>
+          <td class="px-4 py-3.5">
+            {% if d.status == 'online' %}
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-semibold">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+              在线
+            </span>
+            {% else %}
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-500/10 text-slate-400 border border-slate-550/20 text-[10px] font-semibold">
+              <span class="w-1.5 h-1.5 rounded-full bg-slate-450"></span>
+              离线
+            </span>
+            {% endif %}
+          </td>
           <td class="px-4 py-3.5 text-slate-400 font-mono text-[11px]">{{ d.ModelInfo or '--' }}</td>
           <td class="px-4 py-3.5 text-slate-400 font-mono">{{ d.LastConnectTime or '--' }}</td>
           <td class="px-4 py-3.5 flex items-center gap-2">
-            <button class="bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 text-amber-400 px-2.5 py-1 rounded-md font-medium transition active:scale-95" onclick="editDevice({{ d.Id }},'{{ d.MAC or '' }}','{{ d.Longitude or '' }}','{{ d.Latitude or '' }}','{{ d.Address or '' }}',{{ d.AreaId or 1 }},'{{ d.ModelInfo or '' }}')">修改</button>
-            <a href="/admin/device/delete/{{ d.Id }}" class="bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 px-2.5 py-1 rounded-md font-medium transition active:scale-95" onclick="return confirm('确认删除?')">删除</a>
+            <button class="bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 text-amber-400 px-2 py-1 rounded-md font-medium transition active:scale-95 text-[11px]" onclick="editDevice({{ d.Id }},'{{ d.MAC or '' }}','{{ d.Longitude or '' }}','{{ d.Latitude or '' }}','{{ d.Address or '' }}',{{ d.AreaId or 1 }},'{{ d.ModelInfo or '' }}')">修改</button>
+            <button class="bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 px-2 py-1 rounded-md font-medium transition active:scale-95 text-[11px]" onclick="triggerSimulate('device', {{ d.Id }})">模拟故障</button>
+            <a href="/admin/device/delete/{{ d.Id }}" class="bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-455 px-2 py-1 rounded-md font-medium transition active:scale-95 text-[11px]" onclick="return confirm('确认删除?')">删除</a>
           </td>
         </tr>
         {% else %}
         <tr>
-          <td colspan="7" class="px-4 py-8 text-center text-slate-500">暂无AI分析盒数据</td>
+          <td colspan="8" class="px-4 py-8 text-center text-slate-500">暂无AI分析盒数据</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -3436,6 +3978,29 @@ function editDevice(id,mac,lng,lat,addr,area,model){
   document.getElementById('eModel').value=model;
   document.getElementById('editModal').classList.remove('hidden');
 }
+function triggerSimulate(type, id) {
+  const codes = type === 'device' 
+    ? ['算力异常', '算法崩溃', 'NPU过载'] 
+    : ['网络故障', '图像质量差', '视频流中断'];
+  const code = prompt(`请输入要模拟的故障类型 (${codes.join('/')}):`, codes[0]);
+  if (!code) return;
+  const msg = prompt("请输入故障详细描述:", `运维模拟：测试 ${type === 'device' ? 'AI分析盒' : '摄像头'} #${id} 产生 [${code}] 故障告警`);
+  if (!msg) return;
+  
+  fetch('/admin/simulate_error', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({type, id, code, msg})
+  })
+  .then(r => r.json())
+  .then(data => {
+    alert(data.msg);
+    if(data.code === 200) {
+      window.location.reload();
+    }
+  })
+  .catch(err => alert('模拟失败: ' + err));
+}
 </script>
 """, "device")
 
@@ -3470,6 +4035,7 @@ CAMERA_TEMPLATE = make_admin_template("摄像头管理", """
           <th class="px-4 py-3">IP地址</th>
           <th class="px-4 py-3">MAC地址</th>
           <th class="px-4 py-3">安装区域</th>
+          <th class="px-4 py-3">在线状态</th>
           <th class="px-4 py-3">设备型号</th>
           <th class="px-4 py-3">关联AI盒子</th>
           <th class="px-4 py-3">操作</th>
@@ -3483,16 +4049,30 @@ CAMERA_TEMPLATE = make_admin_template("摄像头管理", """
           <td class="px-4 py-3.5 text-slate-300 font-mono">{{ c.IP or '--' }}</td>
           <td class="px-4 py-3.5 text-slate-400 font-mono">{{ c.MAC or '--' }}</td>
           <td class="px-4 py-3.5 text-slate-400">{{ c.AreaName or '--' }}</td>
+          <td class="px-4 py-3.5">
+            {% if c.status == 'online' %}
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-semibold">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+              在线
+            </span>
+            {% else %}
+            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-500/10 text-slate-400 border border-slate-550/20 text-[10px] font-semibold">
+              <span class="w-1.5 h-1.5 rounded-full bg-slate-450"></span>
+              离线
+            </span>
+            {% endif %}
+          </td>
           <td class="px-4 py-3.5 text-slate-400">{{ c.Type }}</td>
           <td class="px-4 py-3.5 text-slate-400 font-mono text-[11px]">{{ c.DeviceMAC or '--' }}</td>
           <td class="px-4 py-3.5 flex items-center gap-2">
-            <button class="bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 text-amber-400 px-2.5 py-1 rounded-md font-medium transition active:scale-95" onclick="editCam({{ c.Id }},'{{ c.IP or '' }}','{{ c.MAC or '' }}','{{ c.CameraUrl or '' }}','{{ c.Name or '' }}','{{ c.Longitude or '' }}','{{ c.Latitude or '' }}',{{ c.AreaId or 1 }},'{{ c.Type or '' }}',{{ c.DeviceId or 1 }})">修改</button>
-            <a href="/admin/camera/delete/{{ c.Id }}" class="bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 px-2.5 py-1 rounded-md font-medium transition active:scale-95" onclick="return confirm('确认删除?')">删除</a>
+            <button class="bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 text-amber-400 px-2 py-1 rounded-md font-medium transition active:scale-95 text-[11px]" onclick="editCam({{ c.Id }},'{{ c.IP or '' }}','{{ c.MAC or '' }}','{{ c.CameraUrl or '' }}','{{ c.Name or '' }}','{{ c.Longitude or '' }}','{{ c.Latitude or '' }}',{{ c.AreaId or 1 }},'{{ c.Type or '' }}',{{ c.DeviceId or 1 }})">修改</button>
+            <button class="bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 px-2 py-1 rounded-md font-medium transition active:scale-95 text-[11px]" onclick="triggerSimulate('camera', {{ c.Id }})">模拟故障</button>
+            <a href="/admin/camera/delete/{{ c.Id }}" class="bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-455 px-2 py-1 rounded-md font-medium transition active:scale-95 text-[11px]" onclick="return confirm('确认删除?')">删除</a>
           </td>
         </tr>
         {% else %}
         <tr>
-          <td colspan="8" class="px-4 py-8 text-center text-slate-500">暂无摄像头数据</td>
+          <td colspan="9" class="px-4 py-8 text-center text-slate-500">暂无摄像头数据</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -3660,6 +4240,29 @@ function editCam(id,ip,mac,url,name,lng,lat,area,type,did){
   document.getElementById('eType').value=type;
   document.getElementById('eDevice').value=did;
   document.getElementById('editModal').classList.remove('hidden');
+}
+function triggerSimulate(type, id) {
+  const codes = type === 'device' 
+    ? ['算力异常', '算法崩溃', 'NPU过载'] 
+    : ['网络故障', '图像质量差', '视频流中断'];
+  const code = prompt(`请输入要模拟的故障类型 (${codes.join('/')}):`, codes[0]);
+  if (!code) return;
+  const msg = prompt("请输入故障详细描述:", `运维模拟：测试 ${type === 'device' ? 'AI分析盒' : '摄像头'} #${id} 产生 [${code}] 故障告警`);
+  if (!msg) return;
+  
+  fetch('/admin/simulate_error', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({type, id, code, msg})
+  })
+  .then(r => r.json())
+  .then(data => {
+    alert(data.msg);
+    if(data.code === 200) {
+      window.location.reload();
+    }
+  })
+  .catch(err => alert('模拟失败: ' + err));
 }
 </script>
 """, "camera")
@@ -3956,6 +4559,7 @@ function showAlarmDetail(id) {
       if (a.videoUrl) {
         video.src = a.videoUrl;
         video.load();
+        video.play().catch(e => console.log("Video play failed:", e));
         video.classList.remove('hidden');
         noVideo.classList.add('hidden');
       } else {
@@ -4178,7 +4782,7 @@ CAMERA_ERROR_TEMPLATE = make_admin_template("摄像头故障日志", """
         {% for e in errors %}
         <tr class="hover:bg-slate-900/20 transition duration-150">
           <td class="px-4 py-3.5 text-slate-400 font-mono">{{ e.Id }}</td>
-          <td class="px-4 py-3.5 text-slate-200 font-medium">{{ e.CameraName or e.CameraId }}</td>
+          <td class="px-4 py-3.5 text-slate-200 font-medium">{{ e.CameraName or ('监控摄像头 #' ~ e.CameraId) }}</td>
           <td class="px-4 py-3.5 text-slate-400 font-mono">{{ e.MAC }}</td>
           <td class="px-4 py-3.5 text-slate-400 font-mono">{{ e.CreateTime }}</td>
           <td class="px-4 py-3.5"><span class="px-2 py-0.5 rounded bg-rose-500/10 text-rose-455 border border-rose-500/20 font-mono text-[10px]">{{ e.ErrorCode }}</span></td>

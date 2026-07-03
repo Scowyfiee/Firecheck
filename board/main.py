@@ -90,9 +90,21 @@ def show_interactive_menu():
     return cfg
 
 if __name__ == "__main__":
+    import shutil
     try:
         # 显示交互式菜单并获取用户配置
         cfg = show_interactive_menu()
+        
+        # 诊断环境中的 ffmpeg 工具是否可用
+        if shutil.which("ffmpeg") is None:
+            print("\n" + "⚠️ " * 25)
+            print(" ⚠️  环境警告 (ENVIRONMENT WARNING):")
+            print(" 发现系统未安装 'ffmpeg' 视频编码工具！")
+            print(" 这会导致录像视频无法转码为 H.264 格式，导致 Web 端无法直接播放。")
+            print(" 请在终端中运行以下命令安装 ffmpeg:")
+            print("     👉 sudo apt update && sudo apt install -y ffmpeg")
+            print("⚠️ " * 25 + "\n")
+            
         # 创建火焰检测器实例并启动主循环
         detector = FlameDetector(cfg)
         detector.run()

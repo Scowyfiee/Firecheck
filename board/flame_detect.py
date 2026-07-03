@@ -167,6 +167,10 @@ class FlameDetector:
         :param config: Config 配置对象, 包含所有运行参数
         """
         self.cfg = config               # 配置对象引用
+        # Dynamically set a unique ws_port based on camera_id if it's default 9999 or None
+        ws_port = getattr(config, "ws_port", 9999)
+        if ws_port == 9999 or ws_port is None:
+            config._cfg["ws_port"] = 9990 + config.camera_id
         self.model = None               # YOLO 模型对象 (PyTorch 或 RKNN)
         self.cap = None                 # OpenCV VideoCapture 摄像头采集对象
         self.running = False            # 主循环运行标志, 设为 False 时所有线程退出
@@ -182,6 +186,7 @@ class FlameDetector:
         self.video_writer = None        # OpenCV VideoWriter 对象, 非 None 表示正在录像
         self.recording = False          # 录像状态标志
         self.record_start_time = 0      # 录像开始时间戳, 用于计算录像时长
+        self.active_writers = []        # 存放并发活动中的录像写入器 (线程安全)
 
         # ---- 检测历史: 用于后续扩展平滑滤波(如连续 N 帧确认) ----
         self.detection_history = deque(maxlen=10)  # 最近 10 帧的检测结果
@@ -318,7 +323,7 @@ class FlameDetector:
             return self._detect_rknn(frame)
         # PyTorch 推理路径: 指定置信度和 IoU 阈值, 限制检测类别, 降低分辨率提速
         results = self.model(frame, conf=self.cfg.conf_threshold, iou=self.cfg.iou_threshold,
-                             classes=self.cfg.detect_classes or None, imgsz=480, verbose=False, device=0)
+                             classes=self.cfg.detect_classes or None, imgsz=480, verbose=False)
         return results[0] if results else None
 
     def _detect_rknn(self, frame):
@@ -421,12 +426,9 @@ class FlameDetector:
 
     def start_recording(self, frame_w=1280, frame_h=720):
         """
-        开始录制告警视频。
+        开始录制告警视频（线程安全）。
         先将帧缓冲区中的历史帧回写到录像开头, 确保视频包含检测触发前的画面上下文。
-        编码器选择: 优先 avc1(H.264) 以兼容 HTML5 播放, 回退到 mp4v。
-
-        :param frame_w: 视频宽度(像素)
-        :param frame_h: 视频高度(像素)
+        返回该次录像的 writer_entry 信息字典。
         """
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"alarm_{ts}.mp4"
@@ -434,80 +436,121 @@ class FlameDetector:
 
         fps = getattr(self, "fps", 20.0)
         if fps <= 0:
-            fps = 20.0  # 安全默认值
+            fps = 20.0
 
-        # 优先使用 avc1 编码器 (H.264/AVC), Web 浏览器原生支持
-        # 若不可用则回退到 mp4v (MPEG-4), 后续会用 ffmpeg 转码
         try:
             fourcc = cv2.VideoWriter_fourcc(*"avc1")
-            self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
-            if not self.video_writer.isOpened():
+            writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
+            if not writer.isOpened():
                 raise Exception("avc1 writer not opened")
         except Exception:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
-
-        self.recording = True
-        self.record_start_time = time.time()
-        self._recorded_frames_filepath = filepath   # 保存路径供 stop_recording 使用
-        self._recorded_frames_filename = filename
+            writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
 
         # 将帧缓冲区中尺寸匹配的历史帧写入视频开头, 实现"回溯录像"
-        # 只有与目标尺寸一致的历史帧才写入, 避免尺寸不匹配导致编码错误
         for f in list(self.frame_buffer):
             fh, fw = f.shape[:2]
             if fw == frame_w and fh == frame_h:
                 try:
-                    self.video_writer.write(f)
+                    writer.write(f)
                 except Exception as e:
                     logger.error(f"Error writing buffered frame: {e}")
-        self.frame_buffer.clear()  # 写完即清空, 防止重复写入
+        self.frame_buffer.clear()
+
+        writer_entry = {
+            "writer": writer,
+            "w": frame_w,
+            "h": frame_h,
+            "filepath": filepath,
+            "filename": filename,
+            "start_time": time.time()
+        }
+
+        with self._frame_lock:
+            self.active_writers.append(writer_entry)
+            self.recording = True
+
         logger.info(f"Recording started with size ({frame_w}x{frame_h}) at {fps} FPS: {filepath}")
+        return writer_entry
 
-    def stop_recording(self):
+    def stop_recording(self, writer_entry=None):
         """
-        停止录像并释放资源。
-        录像停止后自动调用 ffmpeg 将视频转码为 H.264 baseline profile,
-        确保在 Web 端能够直接播放 (HTML5 <video> 标签兼容)。
-
-        :return: (filepath, filename) 最终的视频文件路径和文件名
+        停止录像并释放资源（线程安全）。
+        如果传入 writer_entry，则只停止该特定录像；否则停止所有活跃录像。
+        停止后调用 ffmpeg 进行 H.264 转码（优先使用系统原生 ffmpeg，并支持 libopenh264 备用）。
         """
-        # 释放 VideoWriter
-        if self.video_writer:
-            self.video_writer.release()
-            self.video_writer = None
-        self.recording = False
-        elapsed = time.time() - self.record_start_time
-        logger.info(f"Recording stopped, duration: {elapsed:.1f}s")
+        targets = []
+        if writer_entry is not None:
+            targets = [writer_entry]
+        else:
+            with self._frame_lock:
+                targets = list(self.active_writers)
 
-        # ffmpeg 转码: 统一输出为 H.264 baseline + yuv420p 像素格式
-        # 为什么需要转码: OpenCV 的 avc1/mp4v 编码器产出的视频可能在浏览器中无法直接播放
-        # baseline profile 兼容性最好, yuv420p 是所有浏览器都支持的像素格式
-        filepath = getattr(self, "_recorded_frames_filepath", "")
-        if filepath and os.path.exists(filepath):
-            temp_path = filepath + ".tmp.mp4"  # 临时输出文件, 成功后替换原文件
+        last_filepath = ""
+        last_filename = ""
+
+        for entry in targets:
+            writer = entry["writer"]
+            filepath = entry["filepath"]
+            filename = entry["filename"]
+
             try:
-                cmd = [
-                    "ffmpeg", "-y", "-i", filepath,
-                    "-vcodec", "libx264",       # H.264 编码
-                    "-pix_fmt", "yuv420p",      # 像素格式: 4:2:0 色度子采样, 浏览器兼容
-                    "-profile:v", "baseline",    # 编码档次: baseline 通用性最佳
-                    "-level", "3.0",            # 编码级别: 3.0 支持到 720p
-                    temp_path
-                ]
-                # timeout=8 防止 ffmpeg 卡死长时间阻塞
-                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
-                if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                    os.replace(temp_path, filepath)  # 原子替换, 避免写入中断导致文件损坏
-                    logger.info("Video transcoded successfully to H.264 via ffmpeg")
+                writer.release()
             except Exception as e:
-                logger.warning(f"Video transcoding skipped or ffmpeg not available: {e}")
-                # 清理临时文件
-                if os.path.exists(temp_path):
-                    try: os.remove(temp_path)
-                    except: pass
+                logger.error(f"Error releasing video writer: {e}")
 
-        return getattr(self, "_recorded_frames_filepath", ""), getattr(self, "_recorded_frames_filename", "")
+            with self._frame_lock:
+                if entry in self.active_writers:
+                    self.active_writers.remove(entry)
+                if not self.active_writers:
+                    self.recording = False
+
+            last_filepath = filepath
+            last_filename = filename
+            logger.info(f"Recording stopped, file: {filepath}")
+
+            # 检查文件是否存在，大小是否大于0
+            if filepath and os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                temp_path = filepath + ".tmp.mp4"
+                
+                # 寻找支持完整编码器的 ffmpeg
+                ffmpeg_cmd = "ffmpeg"
+                for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
+                    if os.path.exists(p) and os.access(p, os.X_OK):
+                        ffmpeg_cmd = p
+                        break
+
+                transcode_success = False
+                for encoder in ["libx264", "libopenh264"]:
+                    try:
+                        cmd = [
+                            ffmpeg_cmd, "-y", "-i", filepath,
+                            "-vcodec", encoder,
+                            "-pix_fmt", "yuv420p",
+                            "-profile:v", "baseline",
+                            "-level", "3.0",
+                            temp_path
+                        ]
+                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35)
+                        if res.returncode == 0 and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                            os.replace(temp_path, filepath)
+                            logger.info(f"Video transcoded successfully to H.264 via ffmpeg ({encoder})")
+                            transcode_success = True
+                            break
+                        else:
+                            err_msg = res.stderr.decode('utf-8', errors='ignore')
+                            logger.warning(f"FFmpeg transcode with {encoder} failed (code={res.returncode}): {err_msg[:120]}")
+                    except Exception as e:
+                        logger.warning(f"FFmpeg transcode exception with {encoder}: {e}")
+
+                    if os.path.exists(temp_path):
+                        try: os.remove(temp_path)
+                        except: pass
+
+                if not transcode_success:
+                    logger.error(f"All H.264 transcode attempts failed for {filepath}. Video remains in raw format.")
+
+        return last_filepath, last_filename
 
     # ========================================================================
     # 告警上报: 将图片、视频、检测信息通过 HTTP POST 发送到中心服务端
@@ -559,7 +602,7 @@ class FlameDetector:
 
             url = f"{self.cfg.server_url}/api/alarm"
             # timeout=30: 视频文件可能较大, 需要较长超时时间
-            resp = requests.post(url, data=data, files=files, timeout=30)
+            resp = requests.post(url, data=data, files=files, timeout=30, proxies={"http": None, "https": None})
             if resp.status_code == 200:
                 logger.info(f"Alarm sent to server: {resp.json()}")
                 return True
@@ -625,9 +668,9 @@ class FlameDetector:
 
         # 步骤2: 开始录制视频, 持续 cfg.video_duration 秒
         h, w = frame.shape[:2]
-        self.start_recording(w, h)
+        writer_entry = self.start_recording(w, h)
         time.sleep(self.cfg.video_duration)  # 等待指定时长采集足够画面
-        video_path, video_filename = self.stop_recording()
+        video_path, video_filename = self.stop_recording(writer_entry)
 
         # 步骤3: 上报告警到服务端
         success = self.send_alarm_to_server(image_path, image_filename, video_path, video_filename, detections)
@@ -665,7 +708,7 @@ class FlameDetector:
                 "websocket_port": ws_port,               # 告知服务端 WebSocket 端口, 供前端连接
                 "location": self.cfg.location,
             }
-            resp = requests.post(url, json=data, timeout=10)  # timeout=10: 心跳超时不宜过长
+            resp = requests.post(url, json=data, timeout=10, proxies={"http": None, "https": None})  # timeout=10: 心跳超时不宜过长
             return resp.status_code == 200
         except Exception as e:
             logger.warning(f"Heartbeat failed: {e}")
@@ -741,10 +784,22 @@ class FlameDetector:
         async def handler(ws):
             """
             WebSocket 连接处理器, 每个客户端连接对应一个协程实例。
-            循环从 _latest_frame 读取最新帧并发送, 直到连接关闭或程序停止。
+            首帧发送设备元数据 JSON，随后持续推送标注后的检测画面帧。
             """
             logger.info(f"[WS] New connection from {ws.remote_address}")
             try:
+                # 发送第一帧元数据 JSON 供前端动态识别
+                import json
+                meta = {
+                    "type": "camera_info",
+                    "camera_id": self.cfg.camera_id,
+                    "camera_name": self.cfg.location or f"摄像头{self.cfg.camera_id}",
+                    "location": self.cfg.location,
+                    "area_id": self.cfg.area_id,
+                    "ws_port": port
+                }
+                await ws.send(json.dumps(meta))
+
                 while self.running:
                     # 加锁读取最新帧(线程安全)
                     with self._frame_lock:
@@ -875,12 +930,14 @@ class FlameDetector:
                 # ---------- 帧缓冲: 保留最近 60 帧供告警录像回溯 ----------
                 self.frame_buffer.append(frame.copy())
 
-                # ---------- 录像写入: 如果正在录像, 将当前帧写入视频 ----------
-                if self.recording and self.video_writer:
-                    try:
-                        self.video_writer.write(frame)
-                    except Exception as e:
-                        logger.error(f"Error writing frame to video writer: {e}")
+                # ---------- 录像写入: 如果正在录像, 将当前帧写入所有活跃视频中 ----------
+                if self.recording:
+                    with self._frame_lock:
+                        for entry in list(self.active_writers):
+                            try:
+                                entry["writer"].write(frame)
+                            except Exception as e:
+                                logger.error(f"Error writing frame to safe video writer: {e}")
 
                 # ---------- 检测推理 ----------
                 if getattr(self, "is_mock", False):

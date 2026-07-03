@@ -208,7 +208,7 @@ ssh orangepi@<开发板IP>
 
 # 安装依赖
 sudo apt update
-sudo apt install -y python3-pip python3-opencv
+sudo apt install -y python3-pip python3-opencv ffmpeg
 pip3 install ultralytics requests numpy pyyaml torch --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
@@ -309,3 +309,17 @@ http://127.0.0.1:5000
 ls /dev/video*          # 查看摄像头设备
 v4l2-ctl --list-devices # 查看详细信息
 ```
+
+**Q: 视频回放无法播放，或者一直处于加载状态**
+> 请检查设备端（运行 `main.py` 的环境）是否安装了 `ffmpeg`。如果未安装 `ffmpeg`，录像文件就无法从原生的 `mp4v` 编码自动转码为标准的 `H.264` 编码，导致现代浏览器（Chrome/Safari）因不受支持而无法播放。
+> - **解决方法**：在设备端命令行执行 `sudo apt update && sudo apt install -y ffmpeg` 安装此转码依赖。
+
+**Q: 开启了 Clash 全局代理，导致心跳或上报请求 Connection Refused / ProxyError**
+> 我们已在设备端代码中加入了针对本地地址自动绕过代理的规则。如仍有网络干涉，可以在 Clash 客户端中设置 Bypass (绕过) 本地 IP 与端口（如 `127.0.0.1:5000`），或者在启动检测端和 Web 服务端前关闭 Clash 的系统全局代理。
+
+**Q: 数据大屏启动后显示“无信号连接”，没有默认摄像头列表？**
+> 这是系统最新的 **“智能扫描与动态自发现”** 机制。数据库默认不再硬编码死任何摄像头信息，以保障即插即用：
+> 1. 请在终端运行 `main.py` 开启边缘检测（可手动指定 WebSocket 端口，例如 `9991`）。
+> 2. Web 页面启动后会按照设定的间隔异步扫描局域网指定的端口范围。
+> 3. 一旦扫描到活跃端口并完成首帧 WebSocket 的 JSON 元数据握手，系统将**自动在 SQLite 库表中注册该相机并刷新界面显示**。
+> 4. 您可以直接在页面监控卡片顶部修改“端口范围”、“扫描间隔（秒）”，并点击“手动扫描”立即强制搜索。
