@@ -604,6 +604,14 @@ def dashboard():
     # 所有摄像头列表（用于地图标注）
     cameras = [dict(r) for r in db.execute("SELECT * FROM T_Camera ORDER BY Id").fetchall()]
 
+    # 在线/离线设备统计
+    online_threshold = (datetime.now() - timedelta(seconds=15)).strftime("%Y-%m-%d %H:%M:%S")
+    online_count = db.execute("SELECT COUNT(*) as c FROM T_Device WHERE LastConnectTime >= ?", (online_threshold,)).fetchone()["c"]
+    offline_count = total_devices - online_count
+
+    # AI处理率
+    ai_rate = round(((total_alarms - pending_alarms) / total_alarms * 100) if total_alarms > 0 else 100, 1)
+
     return render_template_string(DASHBOARD_TEMPLATE, user=user,
                                   total_alarms=total_alarms, pending_alarms=pending_alarms,
                                   total_devices=total_devices,
@@ -611,6 +619,8 @@ def dashboard():
                                   month_count=month_count, year_count=year_count,
                                   true_count=true_count, false_count=false_count,
                                   missed_count=missed_count,
+                                  online_count=online_count, offline_count=offline_count,
+                                  ai_rate=ai_rate,
                                   recent_alarms=recent_alarms,
                                   monthly_ranking=monthly_ranking, max_rank=max_rank,
                                   earliest_time=earliest_time,
@@ -1539,14 +1549,19 @@ def api_stats():
     month_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (month_ago,)).fetchone()["c"]
     year_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (year_ago,)).fetchone()["c"]
 
-    # 最新报警列表（优先待处理，按置信度降序）
-    recent_alarms = [dict(r) for r in db.execute(
-        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.Status ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
-
     # 真火警 / 误报 / 漏报 分类统计
     true_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='火灾已确认并报警'").fetchone()["c"]
     false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
     missed_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='漏报记录'").fetchone()["c"]
+
+    # 设备在线/离线统计
+    total_devices = db.execute("SELECT COUNT(*) as c FROM T_Device").fetchone()["c"]
+    online_threshold = (datetime.now() - timedelta(seconds=15)).strftime("%Y-%m-%d %H:%M:%S")
+    online_count = db.execute("SELECT COUNT(*) as c FROM T_Device WHERE LastConnectTime >= ?", (online_threshold,)).fetchone()["c"]
+    offline_count = total_devices - online_count
+
+    # AI处理率 (已处理数 / 总数 * 100)
+    ai_rate = round(((total - pending_alarms) / total * 100) if total > 0 else 100, 1)
 
     earliest_row = db.execute("SELECT MIN(CreatTime) as m FROM T_DetectResult").fetchone()
     earliest_time = earliest_row["m"] if earliest_row and earliest_row["m"] else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1568,6 +1583,9 @@ def api_stats():
         "false_count": false_count,
         "missed_count": missed_count,
         "pending_alarms": pending_alarms,
+        "online_count": online_count,
+        "offline_count": offline_count,
+        "ai_rate": ai_rate,
         "recent_alarms": recent_alarms,
         "monthly_ranking": monthly_ranking,
         "max_rank": max_rank,
@@ -1640,42 +1658,49 @@ LOGIN_TEMPLATE = """
 
 # 管理后台公共导航栏组件模板（固定顶部）
 BASE_NAV = """
-<header class="flex justify-between items-center h-14 border-b border-slate-800/60 bg-slate-950/80 backdrop-blur-md px-6 z-[1000] w-full fixed top-0 left-0 right-0 text-slate-100 font-sans">
+<header class="flex justify-between items-center h-14 border-b border-slate-800/60 bg-[#050c18]/90 backdrop-blur-md px-6 z-[1000] w-full fixed top-0 left-0 right-0 text-slate-100 font-sans">
   <div class="flex items-center gap-3">
-    <span class="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee] animate-pulse"></span>
-    <h1 class="m-0 font-bold text-sm tracking-wider bg-gradient-to-r from-slate-100 to-slate-300 bg-clip-text text-transparent">
+    <svg class="w-6 h-6 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+      <line x1="8" y1="21" x2="16" y2="21"></line>
+      <line x1="12" y1="17" x2="12" y2="21"></line>
+    </svg>
+    <h1 class="m-0 font-bold text-sm tracking-wide text-white">
       视频 AI 智能识别及预警平台
     </h1>
   </div>
-  <nav class="flex items-center gap-4 text-xs">
-    <a href="/dashboard" id="nav-dashboard" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-semibold transition-all duration-205 hover:text-slate-100 hover:bg-slate-900/50 text-slate-400 border border-transparent">
+  <nav class="flex items-center gap-1 text-xs">
+    <a href="/dashboard" id="nav-dashboard" class="relative flex items-center gap-1.5 px-4 py-2 font-semibold transition-all duration-300 text-slate-300 hover:text-white">
       数据大屏
+      <span id="nav-dash-line" class="absolute bottom-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee] hidden"></span>
     </a>
     {% if user.RoleName == '超级管理员' %}
-    <a href="/admin/device" id="nav-device" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-semibold transition-all duration-205 hover:text-slate-100 hover:bg-slate-900/50 text-slate-400 border border-transparent">
+    <a href="/admin/device" id="nav-device" class="relative flex items-center gap-1.5 px-4 py-2 font-semibold transition-all duration-300 text-slate-400 hover:text-white">
       资源管理
+      <span id="nav-device-line" class="absolute bottom-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee] hidden"></span>
     </a>
-    <a href="/admin/config" id="nav-config" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-semibold transition-all duration-205 hover:text-slate-100 hover:bg-slate-900/50 text-slate-400 border border-transparent">
+    <a href="/admin/config" id="nav-config" class="relative flex items-center gap-1.5 px-4 py-2 font-semibold transition-all duration-300 text-slate-400 hover:text-white">
       系统设置
+      <span id="nav-config-line" class="absolute bottom-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee] hidden"></span>
     </a>
     {% endif %}
-    <a href="/admin/alarm" id="nav-alarm" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-semibold transition-all duration-205 hover:text-slate-100 hover:bg-slate-900/50 text-slate-400 border border-transparent">
+    <a href="/admin/alarm" id="nav-alarm" class="relative flex items-center gap-1.5 px-4 py-2 font-semibold transition-all duration-300 text-slate-400 hover:text-white">
       预警中心
+      <span id="nav-alarm-line" class="absolute bottom-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee] hidden"></span>
     </a>
   </nav>
-  <div class="flex items-center gap-4 text-xs">
-    <span id="nav-clock" class="text-cyan-300 font-mono font-bold tracking-wider mr-2 hidden md:inline-block drop-shadow-[0_0_4px_rgba(34,211,238,0.25)]"></span>
-    <span class="inline-flex items-center gap-1.5 text-emerald-450 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-0.5 rounded-full font-semibold text-[10px]">
-      <span class="w-1.5 h-1.5 rounded-full bg-emerald-450"></span> 在线
+  <div class="flex items-center gap-5 text-xs">
+    <span id="nav-clock" class="text-cyan-300 font-mono font-bold tracking-widest mr-1 hidden md:inline-block text-sm drop-shadow-[0_0_6px_rgba(34,211,238,0.4)]"></span>
+    <span class="inline-flex items-center gap-1.5 text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-0.5 rounded-full font-semibold text-[10px]">
+      <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_4px_#34d399]"></span> 在线
     </span>
     <span class="text-slate-300 font-medium">{{ user.Name }}</span>
-    <a href="/logout" class="text-rose-500 hover:text-rose-455 transition-colors font-semibold">退出</a>
+    <a href="/logout" class="text-rose-400 hover:text-rose-300 transition-colors font-semibold">退出</a>
   </div>
 </header>
 <div class="h-14"></div>
 <script>
 document.addEventListener("DOMContentLoaded", function() {
-  // Navigation Clock Update
   function updateNavClock() {
     const el = document.getElementById("nav-clock");
     if (el) {
@@ -1692,12 +1717,14 @@ document.addEventListener("DOMContentLoaded", function() {
   else if (path.includes("/admin/device") || path.includes("/admin/camera")) activeId = "nav-device";
   else if (path.includes("/admin/config") || path.includes("/admin/branch") || path.includes("/admin/user") || path.includes("/admin/role") || path.includes("/admin/dictionary")) activeId = "nav-config";
   else if (path.includes("/admin/alarm") || path.includes("/admin/audit") || path.includes("/admin/camera_error") || path.includes("/admin/device_error") || path.includes("/admin/log")) activeId = "nav-alarm";
-  
+
   if (activeId) {
     const activeEl = document.getElementById(activeId);
     if (activeEl) {
       activeEl.classList.remove("text-slate-400");
-      activeEl.classList.add("text-cyan-400", "bg-cyan-500/10", "border-cyan-500/20");
+      activeEl.classList.add("text-white");
+      const line = document.getElementById(activeId + "-line");
+      if (line) line.classList.remove("hidden");
     }
   }
 });
@@ -1809,35 +1836,40 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body class="bg-gradient-to-tr from-[#030712] via-[#091124] to-[#030712] text-slate-100 h-screen w-screen overflow-hidden flex flex-col font-sans">
 """ + BASE_NAV + """
-<main class="flex-1 grid grid-cols-12 gap-5 p-5 h-[calc(100vh-56px)] overflow-hidden">
-<!-- Left Column: Search & Alarms Timeline -->
+<main class="flex-1 grid grid-cols-12 gap-4 p-4 h-[calc(100vh-56px)] overflow-hidden">
+<!-- Left Column: 实时预警记录 -->
 <section class="col-span-3 flex flex-col h-full overflow-hidden">
-  <!-- Alarm Timeline -->
   <div class="flex-1 h-full glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 overflow-hidden border border-slate-800/80">
-    <div class="flex flex-col gap-2.5">
+    <div class="flex flex-col gap-2.5 shrink-0">
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
           <span class="w-1.5 h-3.5 bg-rose-500 rounded-full shadow-[0_0_8px_#f43f5e]"></span>
-          <span class="text-xs font-bold tracking-wider text-slate-200">报警记录</span>
+          <span class="text-xs font-bold tracking-wider text-slate-200">实时预警记录</span>
           <span class="text-rose-400 text-[10px] font-bold bg-rose-500/10 border border-rose-500/20 px-2.5 py-0.5 rounded-full" id="pendingAlarmsCount">{{ pending_alarms }}</span>
         </div>
-        <div class="flex gap-2">
-          <button onclick="clearAllAlarms()" class="text-[10px] bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-400 px-2 py-0.5 rounded-lg transition active:scale-95 font-semibold">一键处理</button>
-        </div>
+        <button onclick="clearAllAlarms()" class="text-[10px] bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-400 px-3 py-1 rounded-lg transition active:scale-95 font-semibold">一键处理</button>
       </div>
-      <!-- Inline Filters -->
-      <div class="grid grid-cols-12 gap-1.5 text-[9px]">
-        <input type="text" id="searchLocation" placeholder="位置搜索" class="col-span-4 bg-slate-950/50 border border-slate-800/80 rounded px-2 py-1 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-cyan-500/50 transition">
-        <input type="datetime-local" id="startTime" class="col-span-4 bg-slate-950/50 border border-slate-800/80 rounded px-1 py-1 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
-        <input type="datetime-local" id="endTime" class="col-span-4 bg-slate-950/50 border border-slate-800/80 rounded px-1 py-1 text-slate-200 focus:outline-none focus:border-cyan-500/50 transition">
+      <div class="relative">
+        <input type="text" id="searchLocation" placeholder="检索位置/设备..." class="w-full bg-slate-950/50 border border-slate-800/80 rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500/50 transition">
+        <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+        <span class="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+          <input type="datetime-local" id="startTime" class="w-0 opacity-0 absolute" style="width:0;height:0;border:0;padding:0;margin:0;">
+          <button onclick="document.getElementById('startTime').showPicker()" class="text-slate-500 hover:text-cyan-400 transition" title="开始时间">📅</button>
+        </span>
+      </div>
+      <div class="flex gap-1.5 text-[9px]">
+        <input type="datetime-local" id="endTime" class="w-0 opacity-0 absolute" style="width:0;height:0;border:0;padding:0;margin:0;">
+        <button onclick="document.getElementById('endTime').showPicker()" class="flex items-center gap-1 bg-slate-950/50 border border-slate-800/80 rounded px-2 py-1 text-slate-400 hover:text-cyan-400 transition">📅 结束时间</button>
+        <button onclick="filterByTimeRange('today')" class="bg-slate-950/50 border border-slate-800/80 rounded px-2 py-1 text-slate-400 hover:text-cyan-400 hover:border-cyan-500/30 transition">今日</button>
+        <button onclick="filterByTimeRange('week')" class="bg-slate-950/50 border border-slate-800/80 rounded px-2 py-1 text-slate-400 hover:text-orange-400 hover:border-orange-500/30 transition">本周</button>
+        <button onclick="filterByTimeRange('pending')" class="bg-slate-950/50 border border-slate-800/80 rounded px-2 py-1 text-slate-400 hover:text-rose-400 hover:border-rose-500/30 transition">待处理</button>
       </div>
     </div>
-    
     <div class="flex-1 overflow-y-auto pr-1 flex flex-col gap-2 text-xs scrollbar-thin" id="timelineContainer">
       <div class="relative border-l border-slate-800 ml-2 pl-4 flex flex-col gap-3 py-2" id="timelineList">
         {% for a in recent_alarms %}
         <div class="relative mb-2 timeline-item-anim">
-          <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-slate-950 flex items-center justify-center
+          <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-[#050c18] flex items-center justify-center
             {% if a.Status == '1' %} border-rose-500 shadow-[0_0_6px_#f43f5e]
             {% elif a.OperateResult == '误报无需处理' %} border-emerald-500 shadow-[0_0_6px_#10b981]
             {% elif a.OperateResult == '漏报记录' %} border-amber-500 shadow-[0_0_6px_#f59e0b]
@@ -1854,7 +1886,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
               {% endif %}
             </span>
           </span>
-          <div class="glass-panel hover-scale rounded-xl p-3 flex flex-col gap-1 cursor-pointer" onclick="showAlarmDetail({{ a.Id }})">
+          <div class="glass-panel rounded-xl p-3 flex flex-col gap-1.5 cursor-pointer hover:border-cyan-500/20 hover:shadow-[0_0_15px_rgba(6,182,212,0.15)] transition duration-300 border-l-[3px]
+            {% if a.Status == '1' %} border-l-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.1)]
+            {% elif a.OperateResult == '误报无需处理' %} border-l-emerald-500
+            {% elif a.OperateResult == '漏报记录' %} border-l-amber-500
+            {% else %} border-l-blue-500
+            {% endif %}" onclick="showAlarmDetail({{ a.Id }})">
             <div class="flex justify-between items-center">
               <span class="text-rose-400 font-semibold text-[10px]">{% if a.Description and '烟雾' in a.Description and '火焰' not in a.Description %}烟雾预警{% else %}火焰预警{% endif %} {% if a.Confidence %}({{ (a.Confidence*100)|round(1) }}%){% endif %}</span>
               {% if a.Status == '1' %}
@@ -1871,8 +1908,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
               <span class="truncate max-w-[120px]">{{ a.Location or a.AreaName or '未知位置' }}</span>
               <span class="text-cyan-400 font-mono text-[9px] truncate max-w-[80px]">{{ a.CameraName or '摄像头1' }}</span>
             </div>
-            <div class="flex justify-between items-center text-[8px] text-slate-500">
+            <div class="flex justify-between items-center text-[8px] text-slate-500 mt-0.5">
               <span>{{ a.CreatTime or '--' }}</span>
+              <span class="text-cyan-500/70 hover:text-cyan-400 transition">查看详情 →</span>
             </div>
           </div>
         </div>
@@ -1884,184 +1922,188 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   </div>
 </section>
 
-<!-- Middle Column: Monitoring & Snapshots / Charts -->
-<section class="col-span-6 flex flex-col gap-5 h-full overflow-hidden">
-  <!-- Realtime Stream -->
+<!-- Middle Column: 中央监控终端 + AI 智能抓拍 -->
+<section class="col-span-6 flex flex-col gap-4 h-full overflow-hidden">
+  <!-- 中央监控终端 -->
   <div class="flex-1 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 overflow-hidden">
-    <div class="flex items-center justify-between">
+    <div class="flex items-center justify-between shrink-0">
       <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
         <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
-        实时监控画面
+        中央监控终端
       </h2>
       <div class="flex items-center gap-2">
-        <span class="text-[9px] text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded border border-slate-800 flex items-center gap-1">
-          IP: <input type="text" id="scanHost" value="0.0.0.0" class="w-20 bg-transparent text-cyan-400 text-center font-mono focus:outline-none">
-        </span>
-        <span class="text-[9px] text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded border border-slate-800 flex items-center gap-1">
-          端口: <input type="number" id="scanStart" value="9991" class="w-8 bg-transparent text-cyan-400 text-center font-mono focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"> - <input type="number" id="scanEnd" value="9994" class="w-8 bg-transparent text-cyan-400 text-center font-mono focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none">
-        </span>
-        <span class="text-[9px] text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded border border-slate-800 flex items-center gap-1">
-          间隔: <input type="number" id="scanIntervalInput" value="1" class="w-4 bg-transparent text-cyan-400 text-center font-mono focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none">秒
-        </span>
-        <button onclick="triggerDefaultScan()" class="text-[9px] bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 px-2 py-0.5 rounded transition active:scale-95 font-semibold">默认扫描</button>
-        <button onclick="triggerManualScan()" class="text-[9px] bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 px-2 py-0.5 rounded transition active:scale-95 font-semibold">手动扫描</button>
-        <select id="cameraSelector" onchange="changeCameraStream()" class="bg-slate-950/50 border border-slate-800 rounded px-2 py-0.5 text-slate-300 focus:outline-none focus:border-cyan-500/50 transition text-[10px] font-semibold">
+        <button onclick="openScanModal()" class="text-[10px] bg-slate-800/50 hover:bg-slate-800 border border-slate-700 text-slate-300 px-2.5 py-1 rounded-lg transition active:scale-95 font-semibold flex items-center gap-1">⚙️ 扫描设置</button>
+        <select id="cameraSelector" onchange="changeCameraStream()" class="bg-slate-950/50 border border-slate-800 rounded px-2.5 py-1 text-slate-300 focus:outline-none focus:border-cyan-500/50 transition text-[10px] font-semibold min-w-[140px]">
           <option value="" disabled selected>🔍 正在检索监控...</option>
         </select>
-        <span class="text-[9px] text-slate-400 bg-slate-950/50 px-3 py-0.5 rounded-full border border-slate-800">1280x720 | WebSocket</span>
+        <span class="text-[9px] text-slate-500 bg-slate-950/50 px-3 py-1 rounded-full border border-slate-800">1280x720 | WS</span>
       </div>
     </div>
-    <div class="flex-1 bg-slate-950/60 rounded-xl relative overflow-hidden flex items-center justify-center tech-grid-diagonal border border-slate-900 shadow-inner">
+    <div class="flex-1 bg-[#030712] rounded-xl relative overflow-hidden flex items-center justify-center border border-slate-900 shadow-inner">
+      <!-- Tech corner borders -->
+      <div class="absolute top-0 left-0 w-8 h-8 border-t-2 border-l-2 border-cyan-500/30 rounded-tl-lg z-20 pointer-events-none"></div>
+      <div class="absolute top-0 right-0 w-8 h-8 border-t-2 border-r-2 border-cyan-500/30 rounded-tr-lg z-20 pointer-events-none"></div>
+      <div class="absolute bottom-0 left-0 w-8 h-8 border-b-2 border-l-2 border-cyan-500/30 rounded-bl-lg z-20 pointer-events-none"></div>
+      <div class="absolute bottom-0 right-0 w-8 h-8 border-b-2 border-r-2 border-cyan-500/30 rounded-br-lg z-20 pointer-events-none"></div>
+      <!-- Green dot grid background -->
+      <div class="tech-grid-diagonal absolute inset-0 opacity-60"></div>
       <div class="scan-line"></div>
-      <img id="cameraFrame" class="hidden absolute inset-0 w-full h-full object-contain">
+      <img id="cameraFrame" class="hidden absolute inset-0 w-full h-full object-contain z-10">
       <div id="videoOffline" class="flex flex-col items-center gap-4 z-10 text-center p-6 bg-slate-950/40 rounded-2xl border border-slate-900/60 shadow-xl max-w-sm">
-        <div class="relative flex items-center justify-center w-20 h-20 bg-slate-950/80 rounded-full border border-slate-800 shadow-inner">
-          <div class="absolute inset-0 rounded-full border border-cyan-500/20 animate-ping opacity-60"></div>
-          <div class="absolute inset-2 rounded-full border border-cyan-500/10 animate-pulse"></div>
-          <svg class="w-10 h-10 text-cyan-400/90 animate-bounce" fill="none" stroke="currentColor" stroke-width="1.2" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
-            <!-- Satellite solar panels -->
-            <rect x="2" y="10" width="4" height="6" rx="0.5" fill="rgba(6,182,212,0.1)"></rect>
-            <line x1="6" y1="13" x2="9" y2="13"></line>
-            <rect x="18" y="10" width="4" height="6" rx="0.5" fill="rgba(6,182,212,0.1)"></rect>
-            <line x1="15" y1="13" x2="18" y2="13"></line>
-            <!-- Satellite main body -->
-            <rect x="9" y="8" width="6" height="10" rx="1" fill="rgba(6,182,212,0.2)"></rect>
-            <!-- Antenna dish -->
-            <path d="M12 18v2M10 20h4"></path>
-            <!-- Signal transmission waves -->
-            <path d="M8 22c2-1 6-1 8 0" class="animate-pulse"></path>
-            <!-- Details on satellite -->
-            <circle cx="12" cy="11" r="1.5" fill="currentColor"></circle>
+        <div class="relative flex items-center justify-center w-16 h-16">
+          <div class="absolute inset-0 rounded-full border-2 border-dashed border-cyan-500/20 animate-spin" style="animation-duration:3s"></div>
+          <svg class="w-8 h-8 text-cyan-400/70" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+            <polygon points="5 3 19 12 5 21 5 3" fill="rgba(34,211,238,0.1)"/>
           </svg>
         </div>
         <div class="flex flex-col gap-1">
-          <span class="text-cyan-400 text-xs font-bold tracking-widest uppercase">无信号连接 (No Signal)</span>
-          <span class="text-slate-500 text-[10px] max-w-[200px]">未检测到活跃的摄像头网络流</span>
+          <span class="text-cyan-400 text-xs font-bold tracking-widest uppercase">信号连接中断</span>
+          <span class="text-slate-500 text-[10px]">AWAITING VIDEO STREAM...</span>
         </div>
       </div>
-      <span id="videoTag" class="hidden absolute top-3 left-3 bg-rose-500/10 border border-rose-500/20 text-rose-455 text-[9px] font-bold px-2.5 py-0.5 rounded uppercase tracking-wider shadow-md">Offline</span>
+      <span id="videoTag" class="hidden absolute top-3 left-3 flex items-center gap-1.5 z-20">
+        <span class="w-2 h-2 rounded-full bg-rose-500 animate-pulse shadow-[0_0_6px_#f43f5e]"></span>
+        <span class="text-rose-400 text-[9px] font-bold tracking-wider">REC CH-01 MAIN FEED</span>
+        <span class="text-slate-500 text-[8px] ml-1">1080P/60FPS</span>
+      </span>
     </div>
   </div>
-  
-  <!-- Bottom Section: Snapshots & Trend Chart -->
-  <div class="h-52 flex gap-5 shrink-0 overflow-hidden">
-    <!-- Snapshots -->
-    <div class="flex-[3] glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2.5 overflow-hidden border border-slate-800/80">
-      <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
-        <span class="w-1.5 h-3.5 bg-orange-500 rounded-full shadow-[0_0_8px_#f97316]"></span>
-        疑似火灾抓拍记录
-      </h2>
-      <div class="flex-1 flex gap-3 overflow-x-auto pb-1 scrollbar-thin" id="snapshotsContainer">
-        {% set snapshots = recent_alarms|selectattr('Picture')|list %}
-        {% for a in snapshots[:8] %}
-        <div class="w-40 shrink-0 rounded-xl bg-slate-950/40 border border-rose-500/35 p-1.5 flex flex-col gap-1 shadow-[0_0_10px_rgba(244,63,94,0.12)] hover:border-rose-500 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300 cursor-pointer" onclick="showAlarmDetail({{ a.Id }})">
-          <div class="relative aspect-video rounded-lg overflow-hidden border border-rose-500/20">
-            <img src="{{ a.Picture }}" class="w-full h-full object-cover">
-            <span class="absolute bottom-1 right-1 bg-rose-600/90 text-white text-[8px] font-bold px-1.5 py-0.5 rounded shadow shadow-rose-950/50 tracking-wider">疑似火灾</span>
-          </div>
-          <div class="flex flex-col gap-0.5 px-0.5">
-            <div class="flex justify-between items-center text-[9px]">
-              <span class="text-orange-400 font-mono font-semibold">{{ a.CreatTime[11:19] if a.CreatTime else '--' }}</span>
-              <span class="text-slate-400 truncate max-w-[70px] font-medium">{{ a.Location or '--' }}</span>
-            </div>
-          </div>
-        </div>
-        {% else %}
-        <div class="flex items-center justify-center w-full text-slate-650 text-xs">暂无抓拍记录</div>
-        {% endfor %}
-      </div>
-    </div>
 
-    <!-- Trend Chart -->
-    <div class="flex-[2] glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 overflow-hidden border border-slate-800/80">
-      <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
-        <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
-        30天内预警趋势
-      </h2>
-      <div id="trendChart" class="flex-1 w-full h-full"></div>
+  <!-- AI 智能抓拍 -->
+  <div class="h-52 shrink-0 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2.5 overflow-hidden border border-slate-800/80">
+    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2 shrink-0">
+      <span class="w-1.5 h-3.5 bg-orange-500 rounded-full shadow-[0_0_8px_#f97316]"></span>
+      AI 智能抓拍
+    </h2>
+    <div class="flex-1 flex gap-3 overflow-x-auto pb-1 scrollbar-thin" id="snapshotsContainer">
+      {% set snapshots = recent_alarms|selectattr('Picture')|list %}
+      {% for a in snapshots[:3] %}
+      <div class="flex-1 min-w-[140px] shrink-0 rounded-xl bg-slate-950/40 border {% if loop.first %}border-rose-500/50 shadow-[0_0_12px_rgba(244,63,94,0.15)]{% else %}border-slate-800/60{% endif %} p-2 flex flex-col gap-1.5 cursor-pointer hover:border-cyan-500/30 transition duration-300" onclick="showAlarmDetail({{ a.Id }})">
+        <div class="relative aspect-video rounded-lg overflow-hidden border border-slate-800/60">
+          <img src="{{ a.Picture }}" class="w-full h-full object-cover">
+          {% if loop.first %}
+          <span class="absolute top-1 left-1 bg-rose-600/90 text-white text-[8px] font-bold px-1.5 py-0.5 rounded tracking-wider">火灾预警</span>
+          <span class="absolute bottom-1 right-1 bg-pink-600/80 text-white text-[8px] font-bold px-1.5 py-0.5 rounded">FIRE 98%</span>
+          {% endif %}
+        </div>
+        <div class="flex justify-between items-center text-[9px]">
+          <span class="text-orange-400 font-mono font-semibold">{{ a.CreatTime[11:19] if a.CreatTime else '--' }}</span>
+          <span class="text-slate-400 truncate max-w-[60px] font-medium">{{ a.Location or '--' }}</span>
+        </div>
+      </div>
+      {% else %}
+      <div class="flex items-center justify-center w-full text-slate-600 text-xs">暂无抓拍记录</div>
+      {% endfor %}
     </div>
   </div>
 </section>
 
-<!-- Right Column: Time, Statistics & Ranking / Trend Chart -->
+<!-- Right Column: 核心数据指标 + 警情分析 + 趋势 -->
 <section class="col-span-3 flex flex-col gap-4 h-full overflow-hidden">
-  <!-- Clock & Date -->
-  <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 items-center text-center relative overflow-hidden shrink-0 border border-slate-800/80">
-    <div class="absolute -right-4 -top-4 w-16 h-16 bg-cyan-500/10 rounded-full blur-xl"></div>
-    <div id="clock" class="text-3xl font-black tracking-widest text-cyan-300 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.4)]">--</div>
-    <div class="text-[10px] text-slate-400 font-bold tracking-wider uppercase" id="liveDate">--</div>
-  </div>
-  
-  <!-- Stats Box -->
+  <!-- 核心数据指标 -->
   <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 shrink-0 border border-slate-800/80">
     <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
       <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
-      预警数据统计
+      核心数据指标
     </h2>
     <div class="grid grid-cols-2 gap-2.5 text-center">
-      <div onclick="filterByTimeRange('today')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-cyan-500/50 hover:shadow-[0_0_15px_rgba(6,182,212,0.35)] transition duration-300">
-        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">⏰ 今日预警</span>
-        <span class="text-2xl font-black text-cyan-400 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.6)]" id="statToday">{{ today_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <!-- Row 1 -->
+      <div onclick="filterByTimeRange('today')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-2.5 flex flex-col gap-1 relative overflow-hidden group hover:border-cyan-500/40 hover:shadow-[0_0_12px_rgba(6,182,212,0.3)] transition duration-300">
+        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">今日警情</span>
+        <span class="text-xl font-black text-cyan-400 font-mono" id="statToday">{{ today_count }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent opacity-40 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('week')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-orange-500/50 hover:shadow-[0_0_15px_rgba(249,115,22,0.35)] transition duration-300">
-        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">📅 本周预警</span>
-        <span class="text-2xl font-black text-orange-400 font-mono drop-shadow-[0_0_8px_rgba(249,115,22,0.6)]" id="statWeek">{{ week_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-orange-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <div onclick="filterByTimeRange('week')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-2.5 flex flex-col gap-1 relative overflow-hidden group hover:border-orange-500/40 hover:shadow-[0_0_12px_rgba(249,115,22,0.3)] transition duration-300">
+        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">本周警情</span>
+        <span class="text-xl font-black text-orange-400 font-mono" id="statWeek">{{ week_count }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-orange-500 to-transparent opacity-40 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('month')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-pink-500/50 hover:shadow-[0_0_15px_rgba(244,63,94,0.35)] transition duration-300">
-        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">📊 本月预警</span>
-        <span class="text-2xl font-black text-pink-400 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.6)]" id="statMonth">{{ month_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-pink-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <!-- Row 2 -->
+      <div class="bg-slate-950/60 border border-slate-800/50 rounded-xl p-2.5 flex flex-col gap-1 relative overflow-hidden group hover:border-emerald-500/40 transition duration-300">
+        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">在线设备</span>
+        <span class="text-xl font-black text-emerald-400 font-mono" id="statOnline">{{ online_count|default(0) }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-500 to-transparent opacity-40 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('year')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-emerald-500/50 hover:shadow-[0_0_15px_rgba(16,185,129,0.35)] transition duration-300">
-        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">✨ 本年预警</span>
-        <span class="text-2xl font-black text-emerald-400 font-mono drop-shadow-[0_0_8px_rgba(16,185,129,0.6)]" id="statYear">{{ year_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-emerald-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <div class="bg-slate-950/60 border border-slate-800/50 rounded-xl p-2.5 flex flex-col gap-1 relative overflow-hidden group hover:border-slate-500/40 transition duration-300">
+        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">离线设备</span>
+        <span class="text-xl font-black text-slate-400 font-mono" id="statOffline">{{ offline_count|default(0) }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-slate-500 to-transparent opacity-40 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      
-      <!-- Split bottom row -->
-      <div onclick="filterByTimeRange('all')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-blue-500/50 hover:shadow-[0_0_15px_rgba(59,130,246,0.35)] transition duration-300">
-        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">📈 累计预警</span>
-        <span class="text-2xl font-black text-blue-400 font-mono drop-shadow-[0_0_8px_rgba(59,130,246,0.6)]" id="statTotal">{{ total_alarms }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <!-- Row 3 -->
+      <div class="bg-slate-950/60 border border-slate-800/50 rounded-xl p-2.5 flex flex-col gap-1 relative overflow-hidden group hover:border-blue-500/40 hover:shadow-[0_0_12px_rgba(59,130,246,0.3)] transition duration-300">
+        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">AI处理率</span>
+        <span class="text-xl font-black text-blue-400 font-mono" id="statAiRate">{{ ai_rate|default(100) }}<span class="text-xs">%</span></span>
+        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-40 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('pending')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-rose-500/50 hover:shadow-[0_0_15px_rgba(244,63,94,0.35)] transition duration-300">
-        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">🚨 待处理预警</span>
-        <span class="text-2xl font-black text-rose-500 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.6)] animate-pulse" id="statPending">{{ pending_alarms }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-rose-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
-      </div>
-      
-      <!-- Accuracy Ratio Pie Chart -->
-      <div class="col-span-2 bg-slate-950/30 border border-slate-900 rounded-xl p-2.5 flex flex-col gap-1 h-36 relative overflow-hidden">
-        <span class="text-[10px] font-bold text-slate-350 uppercase tracking-wider flex items-center gap-1">
-          <span class="w-1 h-2 bg-rose-500 rounded-full"></span>
-          警情比例 (真火 / 误报 / 漏报)
-        </span>
-        <div id="accuracyChart" class="flex-1 w-full h-full"></div>
+      <div onclick="filterByTimeRange('pending')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-2.5 flex flex-col gap-1 relative overflow-hidden group hover:border-rose-500/40 hover:shadow-[0_0_12px_rgba(244,63,94,0.3)] transition duration-300">
+        <span class="text-slate-400 text-[10px] font-semibold tracking-wider flex items-center justify-center gap-1">待处理</span>
+        <span class="text-xl font-black text-rose-400 font-mono animate-pulse" id="statPending">{{ pending_alarms }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-rose-500 to-transparent opacity-40 group-hover:opacity-100 transition-opacity"></div>
       </div>
     </div>
   </div>
-  
-  <!-- Ranking List -->
-  <div class="flex-1 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 overflow-hidden border border-slate-800/80">
-    <div class="flex items-center justify-between">
-      <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
-        <span class="w-1.5 h-3.5 bg-amber-500 rounded-full shadow-[0_0_8px_#f59e0b]"></span>
-        地区预警排行榜
-      </h2>
+
+  <!-- 警情类型分析 -->
+  <div class="glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 shrink-0 border border-slate-800/80">
+    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
+      <span class="w-1.5 h-3.5 bg-purple-500 rounded-full shadow-[0_0_8px_#a855f7]"></span>
+      警情类型分析
+    </h2>
+    <div class="flex gap-3 h-[130px]">
+      <div class="flex-1 relative" id="pieChartContainer">
+        <div id="accuracyChart" class="w-full h-full"></div>
+        <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div class="text-center">
+            <span class="text-2xl font-black text-slate-100 block" id="pieCenterTotal">{{ total_alarms }}</span>
+            <span class="text-[9px] text-slate-500">总计</span>
+          </div>
+        </div>
+      </div>
+      <div class="flex flex-col justify-center gap-2.5 text-[10px]">
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-sm bg-rose-500 shadow-[0_0_4px_#f43f5e]"></span>
+          <span class="text-slate-400">确认火警</span>
+          <span class="text-slate-300 font-bold ml-auto" id="statTrueCount">{{ true_count }}次</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-sm bg-emerald-500 shadow-[0_0_4px_#10b981]"></span>
+          <span class="text-slate-400">误报记录</span>
+          <span class="text-slate-300 font-bold ml-auto" id="statFalseCount">{{ false_count }}次</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-sm bg-amber-500 shadow-[0_0_4px_#f59e0b]"></span>
+          <span class="text-slate-400">漏报记录</span>
+          <span class="text-slate-300 font-bold ml-auto" id="statMissedCount">{{ missed_count }}次</span>
+        </div>
+      </div>
     </div>
-    
-    <div class="flex-1 overflow-y-auto scrollbar-thin pr-1 flex flex-col">
-      <div class="flex flex-col gap-3 py-1 flex-1 min-h-[120px]" id="rankingList">
+  </div>
+
+  <!-- 30天警情趋势 -->
+  <div class="flex-1 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 overflow-hidden border border-slate-800/80 min-h-0">
+    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2 shrink-0">
+      <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
+      30天警情趋势
+    </h2>
+    <div id="trendChart" class="flex-1 w-full min-h-0"></div>
+  </div>
+
+  <!-- 地区预警排行榜 -->
+  <div class="flex-1 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-3 overflow-hidden border border-slate-800/80 min-h-0">
+    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2 shrink-0">
+      <span class="w-1.5 h-3.5 bg-amber-500 rounded-full shadow-[0_0_8px_#f59e0b]"></span>
+      地区预警排行榜
+    </h2>
+    <div class="flex-1 overflow-y-auto scrollbar-thin pr-1 flex flex-col min-h-0">
+      <div class="flex flex-col gap-2 py-1" id="rankingList">
         {% for item in monthly_ranking %}
-        <div onclick="filterByLocation('{{ item.name }}')" class="cursor-pointer flex flex-col gap-1.5 p-1 rounded hover:bg-slate-950/40 transition">
+        <div onclick="filterByLocation('{{ item.name }}')" class="cursor-pointer flex flex-col gap-1 p-1 rounded hover:bg-slate-950/40 transition">
           <div class="flex justify-between text-[11px] font-medium">
             <span class="text-slate-300">{{ item.name }}</span>
             <span class="text-amber-400 font-semibold">{{ item.count }} 次</span>
           </div>
-          <div class="h-2 w-full bg-slate-950/60 rounded-full overflow-hidden border border-slate-800/40">
-            <div class="h-full bg-gradient-to-r from-cyan-400 to-blue-500 rounded-full shadow-[0_0_8px_rgba(6,182,212,0.3)]" style="width:{{ (item.count/max_rank*100)|round|int }}%"></div>
+          <div class="h-1.5 w-full bg-slate-950/60 rounded-full overflow-hidden border border-slate-800/40">
+            <div class="h-full bg-gradient-to-r from-cyan-400 to-blue-500 rounded-full shadow-[0_0_6px_rgba(6,182,212,0.3)]" style="width:{{ (item.count/max_rank*100)|round|int }}%"></div>
           </div>
         </div>
         {% else %}
@@ -2070,7 +2112,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
-
 </section>
 </main>
 
@@ -2495,45 +2536,29 @@ const accuracyOption = {
   tooltip: {
     trigger: 'item',
     formatter: '{b}: {c} 次 ({d}%)',
-    backgroundColor: 'rgba(15, 23, 42, 0.9)',
+    backgroundColor: 'rgba(15, 23, 42, 0.95)',
     borderColor: 'rgba(34, 211, 238, 0.3)',
     textStyle: { color: '#f1f5f9', fontSize: 10 },
     borderWidth: 1
   },
-  legend: {
-    orient: 'vertical',
-    right: '5%',
-    top: 'center',
-    itemWidth: 10,
-    itemHeight: 10,
-    textStyle: { color: '#cbd5e1', fontSize: 10, fontWeight: 'bold' }
-  },
+  legend: { show: false },
   series: [
     {
       name: '警情比例',
       type: 'pie',
-      radius: ['50%', '80%'],
-      center: ['35%', '50%'],
+      radius: ['55%', '78%'],
+      center: ['50%', '50%'],
       avoidLabelOverlap: false,
-      label: {
-        show: false,
-        position: 'center'
-      },
+      label: { show: false },
       emphasis: {
-        label: {
-          show: true,
-          fontSize: 10,
-          fontWeight: 'bold',
-          color: '#f1f5f9'
-        }
+        label: { show: true, fontSize: 11, fontWeight: 'bold', color: '#f1f5f9' }
       },
-      labelLine: {
-        show: false
-      },
+      labelLine: { show: false },
+      itemStyle: { borderColor: 'rgba(5,12,24,0.8)', borderWidth: 3, borderRadius: 3 },
       data: [
-        { value: {{ true_count }}, name: '确认火警', itemStyle: { color: '#f43f5e' } },
-        { value: {{ false_count }}, name: '误报记录', itemStyle: { color: '#10b981' } },
-        { value: {{ missed_count }}, name: '漏报记录', itemStyle: { color: '#f59e0b' } }
+        { value: {{ true_count }}, name: '确认火警', itemStyle: { color: '#f43f5e', shadowBlur: 8, shadowColor: 'rgba(244,63,94,0.4)' } },
+        { value: {{ false_count }}, name: '误报记录', itemStyle: { color: '#10b981', shadowBlur: 8, shadowColor: 'rgba(16,185,129,0.4)' } },
+        { value: {{ missed_count }}, name: '漏报记录', itemStyle: { color: '#f59e0b', shadowBlur: 8, shadowColor: 'rgba(245,158,11,0.4)' } }
       ]
     }
   ]
@@ -2733,10 +2758,14 @@ function fetchRealtimeData() {
     })
     .then(data => {
       // Update stats count indicators
-      document.getElementById('statToday').textContent = data.today_count;
-      document.getElementById('statWeek').textContent = data.week_count;
-      document.getElementById('statMonth').textContent = data.month_count;
-      document.getElementById('statYear').textContent = data.year_count;
+      const stToday = document.getElementById('statToday');
+      if (stToday) stToday.textContent = data.today_count;
+      const stWeek = document.getElementById('statWeek');
+      if (stWeek) stWeek.textContent = data.week_count;
+      const stMonth = document.getElementById('statMonth');
+      if (stMonth) stMonth.textContent = data.month_count;
+      const stYear = document.getElementById('statYear');
+      if (stYear) stYear.textContent = data.year_count;
       
       const statTotal = document.getElementById('statTotal');
       if (statTotal) statTotal.textContent = data.total;
@@ -2837,14 +2866,25 @@ function fetchRealtimeData() {
 
             const typeName = (a.Description && a.Description.includes('烟雾') && !a.Description.includes('火焰')) ? '烟雾预警' : '火焰预警';
 
+            let leftBorderClass = 'border-l-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.1)]';
+            if (a.Status === '1') {
+              leftBorderClass = 'border-l-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.1)]';
+            } else if (a.OperateResult === '误报无需处理') {
+              leftBorderClass = 'border-l-emerald-500';
+            } else if (a.OperateResult === '漏报记录') {
+              leftBorderClass = 'border-l-amber-500';
+            } else {
+              leftBorderClass = 'border-l-blue-500';
+            }
+
             timelineHtml += `
             <div class="relative mb-2 timeline-item-anim">
-              <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-slate-950 flex items-center justify-center ${dotBorderClass}">
+              <span class="absolute -left-[21px] mt-1 w-2.5 h-2.5 rounded-full border bg-[#050c18] flex items-center justify-center ${dotBorderClass}">
                 <span class="w-1.5 h-1.5 rounded-full relative flex ${dotBgClass}">
                   ${pulseHtml}
                 </span>
               </span>
-              <div class="glass-panel hover-scale rounded-xl p-3 flex flex-col gap-1 cursor-pointer" onclick="showAlarmDetail(${a.Id})">
+              <div class="glass-panel rounded-xl p-3 flex flex-col gap-1.5 cursor-pointer hover:border-cyan-500/20 hover:shadow-[0_0_15px_rgba(6,182,212,0.15)] transition duration-300 border-l-[3px] ${leftBorderClass}" onclick="showAlarmDetail(${a.Id})">
                 <div class="flex justify-between items-center">
                   <span class="text-rose-400 font-semibold text-[10px]">${typeName} ${confBadge}</span>
                   ${statusBadge}
@@ -2853,8 +2893,9 @@ function fetchRealtimeData() {
                   <span class="truncate max-w-[120px]">${location}</span>
                   <span class="text-cyan-400 font-mono text-[9px] truncate max-w-[80px]">${camera}</span>
                 </div>
-                <div class="flex justify-between items-center text-[8px] text-slate-500">
+                <div class="flex justify-between items-center text-[8px] text-slate-500 mt-0.5">
                   <span>${timeStr}</span>
+                  <span class="text-cyan-500/70">查看详情 →</span>
                 </div>
               </div>
             </div>`;
@@ -2863,7 +2904,7 @@ function fetchRealtimeData() {
         }
       }
 
-      // Update Middle Snapshots (recent_alarms with Picture)
+      // Update Middle Snapshots (recent_alarms with Picture) - 3-card layout
       const snapshotsContainer = document.getElementById('snapshotsContainer');
       if (snapshotsContainer) {
         const snapshots = (data.recent_alarms || []).filter(a => a.Picture);
@@ -2871,26 +2912,42 @@ function fetchRealtimeData() {
           snapshotsContainer.innerHTML = '<div class="flex items-center justify-center w-full text-slate-600 text-xs py-8">暂无抓拍记录</div>';
         } else {
           let snapshotsHtml = '';
-          snapshots.slice(0, 8).forEach(a => {
+          snapshots.slice(0, 3).forEach((a, idx) => {
             const location = a.Location || '--';
             const timeStr = a.CreatTime ? a.CreatTime.substring(11, 19) : '--';
+            const isFirst = idx === 0;
             snapshotsHtml += `
-            <div class="w-40 shrink-0 rounded-xl bg-slate-950/40 border border-rose-500/35 p-1.5 flex flex-col gap-1 shadow-[0_0_10px_rgba(244,63,94,0.12)] hover:border-rose-500 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300 cursor-pointer" onclick="showAlarmDetail(${a.Id})">
-              <div class="relative aspect-video rounded-lg overflow-hidden border border-rose-500/20">
+            <div class="flex-1 min-w-[140px] shrink-0 rounded-xl bg-slate-950/40 border ${isFirst ? 'border-rose-500/50 shadow-[0_0_12px_rgba(244,63,94,0.15)]' : 'border-slate-800/60'} p-2 flex flex-col gap-1.5 cursor-pointer hover:border-cyan-500/30 transition duration-300" onclick="showAlarmDetail(${a.Id})">
+              <div class="relative aspect-video rounded-lg overflow-hidden border border-slate-800/60">
                 <img src="${a.Picture}" class="w-full h-full object-cover">
-                <span class="absolute bottom-1 right-1 bg-rose-600/90 text-white text-[8px] font-bold px-1.5 py-0.5 rounded shadow shadow-rose-950/50 tracking-wider">疑似火灾</span>
+                ${isFirst ? '<span class="absolute top-1 left-1 bg-rose-600/90 text-white text-[8px] font-bold px-1.5 py-0.5 rounded tracking-wider">火灾预警</span><span class="absolute bottom-1 right-1 bg-pink-600/80 text-white text-[8px] font-bold px-1.5 py-0.5 rounded">FIRE 98%</span>' : ''}
               </div>
-              <div class="flex flex-col gap-0.5 px-0.5">
-                <div class="flex justify-between items-center text-[9px]">
-                  <span class="text-orange-400 font-mono font-semibold">${timeStr}</span>
-                  <span class="text-slate-400 truncate max-w-[70px] font-medium">${location}</span>
-                </div>
+              <div class="flex justify-between items-center text-[9px]">
+                <span class="text-orange-400 font-mono font-semibold">${timeStr}</span>
+                <span class="text-slate-400 truncate max-w-[60px] font-medium">${location}</span>
               </div>
             </div>`;
           });
           snapshotsContainer.innerHTML = snapshotsHtml;
         }
       }
+
+      // Update new metric elements
+      const statOnline = document.getElementById('statOnline');
+      if (statOnline) statOnline.textContent = data.online_count || 0;
+      const statOffline = document.getElementById('statOffline');
+      if (statOffline) statOffline.textContent = data.offline_count || 0;
+      const statAiRate = document.getElementById('statAiRate');
+      if (statAiRate) {
+        const rate = data.ai_rate !== undefined ? data.ai_rate : 100;
+        statAiRate.innerHTML = rate + '<span class="text-xs">%</span>';
+      }
+      const statMonth = document.getElementById('statMonth');
+      if (statMonth) statMonth.textContent = data.month_count;
+      const statYear = document.getElementById('statYear');
+      if (statYear) statYear.textContent = data.year_count;
+      const statTotal = document.getElementById('statTotal');
+      if (statTotal) statTotal.textContent = data.total;
 
       // Update Right Ranking List (monthly_ranking)
       const rankingList = document.getElementById('rankingList');
@@ -2930,12 +2987,23 @@ function fetchRealtimeData() {
         accuracyChartInstance.setOption({
           series: [{
             data: [
-              { value: data.true_count || 0, name: '确认火警', itemStyle: { color: '#f43f5e' } },
-              { value: data.false_count || 0, name: '误报记录', itemStyle: { color: '#10b981' } },
-              { value: data.missed_count || 0, name: '漏报记录', itemStyle: { color: '#f59e0b' } }
+              { value: data.true_count || 0, name: '确认火警', itemStyle: { color: '#f43f5e', shadowBlur: 8, shadowColor: 'rgba(244,63,94,0.4)' } },
+              { value: data.false_count || 0, name: '误报记录', itemStyle: { color: '#10b981', shadowBlur: 8, shadowColor: 'rgba(16,185,129,0.4)' } },
+              { value: data.missed_count || 0, name: '漏报记录', itemStyle: { color: '#f59e0b', shadowBlur: 8, shadowColor: 'rgba(245,158,11,0.4)' } }
             ]
           }]
         });
+        // Update pie center total
+        const total = (data.true_count || 0) + (data.false_count || 0) + (data.missed_count || 0);
+        const pieTotal = document.getElementById('pieCenterTotal');
+        if (pieTotal) pieTotal.textContent = total || data.total || 0;
+        // Update legend values
+        const trueEl = document.getElementById('statTrueCount');
+        if (trueEl) trueEl.textContent = (data.true_count || 0) + '次';
+        const falseEl = document.getElementById('statFalseCount');
+        if (falseEl) falseEl.textContent = (data.false_count || 0) + '次';
+        const missedEl = document.getElementById('statMissedCount');
+        if (missedEl) missedEl.textContent = (data.missed_count || 0) + '次';
       }
     })
     .catch(err => console.error('Error fetching stats:', err));
@@ -2986,6 +3054,48 @@ document.addEventListener("DOMContentLoaded", function() {
     });
   }
 });
+</script>
+
+<!-- Scan Settings Modal -->
+<div id="scanModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 backdrop-blur-sm p-4 animate-fade-in">
+  <div class="glass-panel w-full max-w-sm rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] border border-slate-700/50 overflow-hidden flex flex-col animate-scale-in">
+    <div class="px-5 py-3 border-b border-slate-800 flex justify-between items-center bg-slate-950/40">
+      <h3 class="text-sm font-bold text-slate-100 flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-cyan-500 animate-pulse"></span>
+        扫描设置
+      </h3>
+      <button onclick="closeScanModal()" class="text-slate-400 hover:text-slate-200 transition text-lg">&times;</button>
+    </div>
+    <div class="p-5 flex flex-col gap-4 text-xs">
+      <div class="flex flex-col gap-1.5">
+        <label class="text-slate-400 font-medium">扫描 IP 地址</label>
+        <input type="text" id="scanHost" value="0.0.0.0" class="w-full bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2 text-cyan-400 text-center font-mono focus:outline-none focus:border-cyan-500/50 transition">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div class="flex flex-col gap-1.5">
+          <label class="text-slate-400 font-medium">起始端口</label>
+          <input type="number" id="scanStart" value="9991" class="w-full bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2 text-cyan-400 text-center font-mono focus:outline-none focus:border-cyan-500/50 transition [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none">
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <label class="text-slate-400 font-medium">结束端口</label>
+          <input type="number" id="scanEnd" value="9994" class="w-full bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2 text-cyan-400 text-center font-mono focus:outline-none focus:border-cyan-500/50 transition [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none">
+        </div>
+      </div>
+      <div class="flex flex-col gap-1.5">
+        <label class="text-slate-400 font-medium">扫描间隔 (秒)</label>
+        <input type="number" id="scanIntervalInput" value="1" class="w-full bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2 text-cyan-400 text-center font-mono focus:outline-none focus:border-cyan-500/50 transition [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none">
+      </div>
+      <div class="flex gap-2.5 mt-1">
+        <button onclick="triggerDefaultScan();closeScanModal();" class="flex-1 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-400 py-2 rounded-lg font-semibold transition active:scale-95">AUTO 扫描</button>
+        <button onclick="triggerManualScan();closeScanModal();" class="flex-1 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-400 py-2 rounded-lg font-semibold transition active:scale-95">MANUAL 扫描</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function openScanModal() { document.getElementById('scanModal').classList.remove('hidden'); }
+function closeScanModal() { document.getElementById('scanModal').classList.add('hidden'); }
 </script>
 
 <!-- Alarm Detail Modal -->
@@ -3131,6 +3241,12 @@ def make_admin_template(title, content_html, active_menu):
     Returns:
         str: 完整的 HTML 页面字符串
     """
+    # Build sidebar active item with vertical cyan bar
+    def sidebar_link(href, icon, label, menu_name):
+        if active_menu == menu_name:
+            return f'<a href="{href}" class="relative flex items-center gap-2.5 px-3 py-2.5 rounded-r-lg text-xs font-semibold transition bg-cyan-500/8 text-cyan-400 border-cyan-500/20"><span class="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 bg-cyan-400 rounded-r-full shadow-[0_0_8px_#22d3ee]"></span><span class="ml-1">{icon}</span> {label}</a>'
+        return f'<a href="{href}" class="flex items-center gap-2.5 px-4 py-2.5 rounded-r-lg text-xs font-semibold transition text-slate-400 hover:text-slate-200 hover:bg-slate-900/30">{icon} {label}</a>'
+
     return """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3142,8 +3258,8 @@ def make_admin_template(title, content_html, active_menu):
   <style>
     .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
     .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
-    .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
-    .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
     .glass-panel {
       background: rgba(15, 23, 42, 0.45);
       backdrop-filter: blur(12px);
@@ -3164,83 +3280,58 @@ def make_admin_template(title, content_html, active_menu):
     .animate-scale-in {
       animation: scaleIn 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
     }
+    body { background-color: #050c18; }
   </style>
 </head>
 <body class="bg-gradient-to-tr from-[#030712] via-[#091124] to-[#030712] text-slate-100 min-h-screen flex flex-col font-sans">
 """ + BASE_NAV + """
 <div class="flex flex-1 min-h-[calc(100vh-56px)]">
   <!-- Sidebar -->
-  <aside class="w-64 bg-slate-950/40 border-r border-slate-900 p-5 shrink-0 flex flex-col gap-6 backdrop-blur-md">
+  <aside class="w-60 bg-[#060e1a]/80 border-r border-slate-800/40 py-5 shrink-0 flex flex-col gap-5 backdrop-blur-md">
     {% if user.RoleName == '超级管理员' %}
-    <div class="flex flex-col gap-1.5">
-      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-2">资源管理</div>
-      <div class="flex flex-col gap-0.5">
-        <a href="/admin/device" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'device' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>💻</span> AI分析盒管理
-        </a>
-        <a href="/admin/camera" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'camera' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>📷</span> 摄像头管理
-        </a>
-      </div>
+    <div class="flex flex-col gap-0.5">
+      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-4 mb-1">资源管理</div>
+      """ + sidebar_link('/admin/device', '💻', 'AI分析盒管理', 'device') + """
+      """ + sidebar_link('/admin/camera', '📷', '摄像头管理', 'camera') + """
     </div>
     {% endif %}
-    
-    <div class="flex flex-col gap-1.5">
-      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-2">事件处理</div>
-      <div class="flex flex-col gap-0.5">
-        <a href="/admin/alarm" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'alarm' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>🚨</span> 报警事件
-        </a>
-        <a href="/admin/audit" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'audit' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>🛡️</span> 事件处理审核
-        </a>
-      </div>
+
+    <div class="flex flex-col gap-0.5">
+      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-4 mb-1">事件处理</div>
+      """ + sidebar_link('/admin/alarm', '🚨', '报警事件', 'alarm') + """
+      """ + sidebar_link('/admin/audit', '🛡️', '事件处理审核', 'audit') + """
     </div>
-    
+
     {% if user.RoleName == '超级管理员' %}
-    <div class="flex flex-col gap-1.5">
-      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-2">系统设置</div>
-      <div class="flex flex-col gap-0.5">
-        <a href="/admin/config" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'config' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>⚙️</span> 系统参数配置
-        </a>
-        <a href="/admin/branch" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'branch' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>🏢</span> 部门/机构管理
-        </a>
-        <a href="/admin/user" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'user' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>👤</span> 用户账户管理
-        </a>
-        <a href="/admin/role" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'role' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>🔑</span> 角色权限管理
-        </a>
-        <a href="/admin/dictionary" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'dictionary' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>📖</span> 数据字典项
-        </a>
-      </div>
+    <div class="flex flex-col gap-0.5">
+      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-4 mb-1">系统设置</div>
+      """ + sidebar_link('/admin/config', '⚙️', '系统参数配置', 'config') + """
+      """ + sidebar_link('/admin/branch', '🏢', '部门/机构管理', 'branch') + """
+      """ + sidebar_link('/admin/user', '👤', '用户账户管理', 'user') + """
+      """ + sidebar_link('/admin/role', '🔑', '角色权限管理', 'role') + """
+      """ + sidebar_link('/admin/dictionary', '📖', '数据字典项', 'dictionary') + """
     </div>
-    
-    <div class="flex flex-col gap-1.5">
-      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-2">故障与日志</div>
-      <div class="flex flex-col gap-0.5">
-        <a href="/admin/camera_error" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'camera_error' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>⚠️</span> 摄像头故障
-        </a>
-        <a href="/admin/device_error" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'device_error' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>📦</span> AI分析盒故障
-        </a>
-        <a href="/admin/log/access" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'access_log' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>🔒</span> 访问安全日志
-        </a>
-        <a href="/admin/log/operate" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-semibold transition """ + ('bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' if active_menu == 'operate_log' else 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/40') + """">
-          <span>📝</span> 业务操作日志
-        </a>
-      </div>
+
+    <div class="flex flex-col gap-0.5">
+      <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider px-4 mb-1">故障与日志</div>
+      """ + sidebar_link('/admin/camera_error', '⚠️', '摄像头故障', 'camera_error') + """
+      """ + sidebar_link('/admin/device_error', '📦', 'AI分析盒故障', 'device_error') + """
+      """ + sidebar_link('/admin/log/access', '🔒', '访问安全日志', 'access_log') + """
+      """ + sidebar_link('/admin/log/operate', '📝', '业务操作日志', 'operate_log') + """
     </div>
     {% endif %}
   </aside>
 
   <!-- Main Content -->
-  <main class="flex-1 p-6 overflow-y-auto scrollbar-thin">
+  <main class="flex-1 p-6 overflow-y-auto scrollbar-thin flex flex-col gap-5">
+    <!-- Welcome Banner -->
+    <div class="bg-emerald-500/5 border border-emerald-500/15 rounded-xl px-5 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center text-emerald-400 text-sm">👋</div>
+        <span class="text-sm text-emerald-300 font-semibold">欢迎回来，<span class="text-emerald-400">{{ user.Name }}</span>！</span>
+      </div>
+      <span class="text-[10px] text-slate-500">视频 AI 智能识别及预警管理平台</span>
+    </div>
     """ + content_html + """
   </main>
 </div>
