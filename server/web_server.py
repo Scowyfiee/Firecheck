@@ -288,6 +288,26 @@ CREATE TABLE IF NOT EXISTS T_UserLoginLog (
         db.commit()
     except Exception:
         pass
+
+    # Auto-migrate: update existing T_DetectResult.CreatTime to recent/current times if they are stale
+    try:
+        c = db.execute("SELECT COUNT(*) FROM T_DetectResult").fetchone()
+        if c and c[0] > 0:
+            latest_row = db.execute("SELECT MAX(CreatTime) FROM T_DetectResult").fetchone()
+            if latest_row and latest_row[0]:
+                latest_time = datetime.strptime(latest_row[0], "%Y-%m-%d %H:%M:%S")
+                time_diff = datetime.now() - latest_time
+                if time_diff.days > 2:
+                    rows = db.execute("SELECT Id, CreatTime FROM T_DetectResult").fetchall()
+                    for r in rows:
+                        old_time = datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")
+                        new_time = old_time + time_diff
+                        new_time_str = new_time.strftime("%Y-%m-%d %H:%M:%S")
+                        db.execute("UPDATE T_DetectResult SET CreatTime = ? WHERE Id = ?", (new_time_str, r[0]))
+                    db.commit()
+    except Exception as e:
+        print(f"Failed to auto-migrate database timestamps: {e}")
+
     db.close()
     seed_data()  # 初始化完成后填充种子数据
 
@@ -1486,21 +1506,33 @@ def api_stats():
     """
     db = get_db()
     check_and_log_faults(db)
-    # 各区域报警数量分布（用于地图热力图/柱状图）
-    area = [dict(r) for r in db.execute(
-        "SELECT a.Name as name, COUNT(dr.Id) as value FROM T_Area a LEFT JOIN T_DetectResult dr ON a.Id=dr.AreaId GROUP BY a.Id").fetchall()]
-    # 近30天每日报警趋势
-    time_data = [dict(r) for r in db.execute(
-        "SELECT strftime('%Y-%m-%d', CreatTime) as date, COUNT(*) as count FROM T_DetectResult WHERE CreatTime > datetime('now','-30 day') GROUP BY date ORDER BY date").fetchall()]
-    total = db.execute("SELECT COUNT(*) as c FROM T_DetectResult").fetchone()["c"]
-
-    pending_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE Status='1'").fetchone()["c"]
-
     # 各时间段统计数据
     today_start = datetime.now().strftime("%Y-%m-%d")
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     year_ago = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 各区域报警数量分布（用于地图热力图/柱状图）
+    area = [dict(r) for r in db.execute(
+        "SELECT a.Name as name, COUNT(dr.Id) as value FROM T_Area a LEFT JOIN T_DetectResult dr ON a.Id=dr.AreaId GROUP BY a.Id").fetchall()]
+    
+    # 近30天每日报警趋势
+    time_data = [dict(r) for r in db.execute(
+        "SELECT strftime('%Y-%m-%d', CreatTime) as date, COUNT(*) as count FROM T_DetectResult WHERE CreatTime > ? GROUP BY date ORDER BY date", (month_ago,)).fetchall()]
+    
+    # 对趋势数据进行30天补全，避免没有数据的天数为空，或者只有一个点时ECharts无法连线的问题
+    last_30_days = {}
+    for i in range(29, -1, -1):
+        d_str = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        last_30_days[d_str] = 0
+    for r in time_data:
+        date_str = r["date"]
+        if date_str in last_30_days:
+            last_30_days[date_str] = r["count"]
+    time_data_padded = [{"date": k, "count": v} for k, v in sorted(last_30_days.items())]
+
+    total = db.execute("SELECT COUNT(*) as c FROM T_DetectResult").fetchone()["c"]
+    pending_alarms = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE Status='1'").fetchone()["c"]
 
     today_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime >= ?", (today_start,)).fetchone()["c"]
     week_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE CreatTime > ?", (week_ago,)).fetchone()["c"]
@@ -1526,7 +1558,7 @@ def api_stats():
 
     return jsonify({
         "area_stats": area,
-        "time_stats": time_data,
+        "time_stats": time_data_padded,
         "total": total,
         "today_count": today_count,
         "week_count": week_count,
@@ -1911,10 +1943,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
   
-  <!-- Bottom Section: Snapshots -->
+  <!-- Bottom Section: Snapshots & Trend Chart -->
   <div class="h-52 flex gap-5 shrink-0 overflow-hidden">
     <!-- Snapshots -->
-    <div class="w-full glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2.5 overflow-hidden border border-slate-800/80">
+    <div class="flex-[3] glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2.5 overflow-hidden border border-slate-800/80">
       <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
         <span class="w-1.5 h-3.5 bg-orange-500 rounded-full shadow-[0_0_8px_#f97316]"></span>
         疑似火灾抓拍记录
@@ -1939,6 +1971,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         {% endfor %}
       </div>
     </div>
+
+    <!-- Trend Chart -->
+    <div class="flex-[2] glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 overflow-hidden border border-slate-800/80">
+      <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
+        <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
+        30天内预警趋势
+      </h2>
+      <div id="trendChart" class="flex-1 w-full h-full"></div>
+    </div>
   </div>
 </section>
 
@@ -1957,43 +1998,43 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
       预警数据统计
     </h2>
-    <div class="grid grid-cols-2 gap-2 text-center">
-      <div onclick="filterByTimeRange('today')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-cyan-500/40 hover:shadow-[0_0_15px_rgba(6,182,212,0.25)] transition duration-300">
-        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">⏰ 今日预警</span>
-        <span class="text-xl font-black text-cyan-400 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.5)]" id="statToday">{{ today_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+    <div class="grid grid-cols-2 gap-2.5 text-center">
+      <div onclick="filterByTimeRange('today')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-cyan-500/50 hover:shadow-[0_0_15px_rgba(6,182,212,0.35)] transition duration-300">
+        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">⏰ 今日预警</span>
+        <span class="text-2xl font-black text-cyan-400 font-mono drop-shadow-[0_0_8px_rgba(34,211,238,0.6)]" id="statToday">{{ today_count }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('week')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-orange-500/40 hover:shadow-[0_0_15px_rgba(249,115,22,0.25)] transition duration-300">
-        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">📅 本周预警</span>
-        <span class="text-xl font-black text-orange-400 font-mono drop-shadow-[0_0_8px_rgba(249,115,22,0.5)]" id="statWeek">{{ week_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-orange-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <div onclick="filterByTimeRange('week')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-orange-500/50 hover:shadow-[0_0_15px_rgba(249,115,22,0.35)] transition duration-300">
+        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">📅 本周预警</span>
+        <span class="text-2xl font-black text-orange-400 font-mono drop-shadow-[0_0_8px_rgba(249,115,22,0.6)]" id="statWeek">{{ week_count }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-orange-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('month')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-pink-500/40 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300">
-        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">📊 本月预警</span>
-        <span class="text-xl font-black text-pink-400 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.5)]" id="statMonth">{{ month_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-pink-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <div onclick="filterByTimeRange('month')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-pink-500/50 hover:shadow-[0_0_15px_rgba(244,63,94,0.35)] transition duration-300">
+        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">📊 本月预警</span>
+        <span class="text-2xl font-black text-pink-400 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.6)]" id="statMonth">{{ month_count }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-pink-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('year')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-emerald-500/40 hover:shadow-[0_0_15px_rgba(16,185,129,0.25)] transition duration-300">
-        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">✨ 本年预警</span>
-        <span class="text-xl font-black text-emerald-400 font-mono drop-shadow-[0_0_8px_rgba(16,185,129,0.5)]" id="statYear">{{ year_count }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <div onclick="filterByTimeRange('year')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-emerald-500/50 hover:shadow-[0_0_15px_rgba(16,185,129,0.35)] transition duration-300">
+        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">✨ 本年预警</span>
+        <span class="text-2xl font-black text-emerald-400 font-mono drop-shadow-[0_0_8px_rgba(16,185,129,0.6)]" id="statYear">{{ year_count }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-emerald-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
       
       <!-- Split bottom row -->
-      <div onclick="filterByTimeRange('all')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-blue-500/40 hover:shadow-[0_0_15px_rgba(59,130,246,0.25)] transition duration-300">
-        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">📈 累计预警</span>
-        <span class="text-xl font-black text-blue-400 font-mono drop-shadow-[0_0_8px_rgba(59,130,246,0.5)]" id="statTotal">{{ total_alarms }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <div onclick="filterByTimeRange('all')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-blue-500/50 hover:shadow-[0_0_15px_rgba(59,130,246,0.35)] transition duration-300">
+        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">📈 累计预警</span>
+        <span class="text-2xl font-black text-blue-400 font-mono drop-shadow-[0_0_8px_rgba(59,130,246,0.6)]" id="statTotal">{{ total_alarms }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
-      <div onclick="filterByTimeRange('pending')" class="cursor-pointer bg-slate-950/50 border border-slate-850 rounded-xl p-2 flex flex-col gap-0.5 relative overflow-hidden group hover:border-rose-500/40 hover:shadow-[0_0_15px_rgba(244,63,94,0.25)] transition duration-300">
-        <span class="text-slate-450 text-[9px] font-semibold tracking-wider flex items-center justify-center gap-0.5">🚨 待处理预警</span>
-        <span class="text-xl font-black text-rose-500 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.5)] animate-pulse" id="statPending">{{ pending_alarms }}</span>
-        <div class="absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-rose-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+      <div onclick="filterByTimeRange('pending')" class="cursor-pointer bg-slate-950/60 border border-slate-800/50 rounded-xl p-3 flex flex-col gap-1.5 relative overflow-hidden group hover:border-rose-500/50 hover:shadow-[0_0_15px_rgba(244,63,94,0.35)] transition duration-300">
+        <span class="text-slate-300 text-xs font-bold tracking-wider flex items-center justify-center gap-1">🚨 待处理预警</span>
+        <span class="text-2xl font-black text-rose-500 font-mono drop-shadow-[0_0_8px_rgba(244,63,94,0.6)] animate-pulse" id="statPending">{{ pending_alarms }}</span>
+        <div class="absolute inset-x-0 bottom-0 h-[3px] bg-gradient-to-r from-transparent via-rose-500 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
       </div>
       
       <!-- Accuracy Ratio Pie Chart -->
-      <div class="col-span-2 bg-slate-950/30 border border-slate-900 rounded-xl p-2 flex flex-col gap-1 h-36 relative overflow-hidden">
-        <span class="text-[8px] font-bold text-slate-450 uppercase tracking-wider flex items-center gap-1">
+      <div class="col-span-2 bg-slate-950/30 border border-slate-900 rounded-xl p-2.5 flex flex-col gap-1 h-36 relative overflow-hidden">
+        <span class="text-[10px] font-bold text-slate-350 uppercase tracking-wider flex items-center gap-1">
           <span class="w-1 h-2 bg-rose-500 rounded-full"></span>
           警情比例 (真火 / 误报 / 漏报)
         </span>
@@ -2011,8 +2052,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       </h2>
     </div>
     
-    <div class="flex-1 overflow-y-auto scrollbar-thin pr-1">
-      <div class="flex flex-col gap-3 justify-center py-1" id="rankingList">
+    <div class="flex-1 overflow-y-auto scrollbar-thin pr-1 flex flex-col">
+      <div class="flex flex-col gap-3 py-1 flex-1 min-h-[120px]" id="rankingList">
         {% for item in monthly_ranking %}
         <div onclick="filterByLocation('{{ item.name }}')" class="cursor-pointer flex flex-col gap-1.5 p-1 rounded hover:bg-slate-950/40 transition">
           <div class="flex justify-between text-[11px] font-medium">
@@ -2024,20 +2065,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
         {% else %}
-        <div class="flex items-center justify-center h-full text-slate-600 text-xs">暂无数据</div>
+        <div class="flex items-center justify-center flex-1 text-slate-600 text-xs py-8">暂无数据</div>
         {% endfor %}
       </div>
     </div>
   </div>
 
-  <!-- Trend Chart -->
-  <div class="h-48 glass-panel rounded-2xl p-4 shadow-[0_8px_32px_rgba(0,0,0,0.37)] flex flex-col gap-2 overflow-hidden border border-slate-800/80 shrink-0">
-    <h2 class="text-xs font-bold tracking-wider text-slate-200 flex items-center gap-2">
-      <span class="w-1.5 h-3.5 bg-cyan-400 rounded-full shadow-[0_0_8px_#22d3ee]"></span>
-      30天内预警趋势
-    </h2>
-    <div id="trendChart" class="flex-1 w-full h-full"></div>
-  </div>
 </section>
 </main>
 
@@ -2471,9 +2504,9 @@ const accuracyOption = {
     orient: 'vertical',
     right: '5%',
     top: 'center',
-    itemWidth: 8,
-    itemHeight: 8,
-    textStyle: { color: '#94a3b8', fontSize: 8 }
+    itemWidth: 10,
+    itemHeight: 10,
+    textStyle: { color: '#cbd5e1', fontSize: 10, fontWeight: 'bold' }
   },
   series: [
     {
@@ -2489,7 +2522,7 @@ const accuracyOption = {
       emphasis: {
         label: {
           show: true,
-          fontSize: 9,
+          fontSize: 10,
           fontWeight: 'bold',
           color: '#f1f5f9'
         }
@@ -2510,9 +2543,9 @@ const trendOption = {
   backgroundColor: 'transparent',
   tooltip: {
     trigger: 'axis',
-    backgroundColor: 'rgba(15, 23, 42, 0.9)',
-    borderColor: 'rgba(34, 211, 238, 0.3)',
-    textStyle: { color: '#f1f5f9', fontSize: 10 },
+    backgroundColor: 'rgba(15, 23, 42, 0.95)',
+    borderColor: 'rgba(34, 211, 238, 0.5)',
+    textStyle: { color: '#f1f5f9', fontSize: 11 },
     borderWidth: 1,
     borderRadius: 8,
     shadowColor: 'rgba(0, 0, 0, 0.5)',
@@ -2530,13 +2563,13 @@ const trendOption = {
     boundaryGap: false,
     data: [],
     axisLine: { lineStyle: { color: chartLineColor } },
-    axisLabel: { color: chartTextColor, fontSize: 8 },
+    axisLabel: { color: '#94a3b8', fontSize: 10, fontWeight: 'medium' },
     splitLine: { show: false }
   },
   yAxis: {
     type: 'value',
     axisLine: { show: false },
-    axisLabel: { color: chartTextColor, fontSize: 8 },
+    axisLabel: { color: '#94a3b8', fontSize: 10, fontWeight: 'medium' },
     splitLine: { lineStyle: { color: chartLineColor, type: 'dashed' } }
   },
   series: [{
@@ -2545,7 +2578,7 @@ const trendOption = {
     smooth: true,
     symbol: 'circle',
     symbolSize: 6,
-    showSymbol: false,
+    showSymbol: true,
     itemStyle: { color: '#22d3ee' },
     lineStyle: { width: 3, color: '#22d3ee', shadowColor: 'rgba(34, 211, 238, 0.5)', shadowBlur: 8 },
     areaStyle: {
@@ -2863,7 +2896,7 @@ function fetchRealtimeData() {
       const rankingList = document.getElementById('rankingList');
       if (rankingList && data.monthly_ranking) {
         if (data.monthly_ranking.length === 0) {
-          rankingList.innerHTML = '<div class="flex items-center justify-center h-full text-slate-600 text-xs">暂无数据</div>';
+          rankingList.innerHTML = '<div class="flex items-center justify-center flex-1 text-slate-600 text-xs py-8">暂无数据</div>';
         } else {
           let rankingHtml = '';
           const maxRank = data.max_rank || 1;
@@ -2872,8 +2905,8 @@ function fetchRealtimeData() {
             rankingHtml += `
             <div onclick="filterByLocation('${item.name}')" class="cursor-pointer flex flex-col gap-1.5 p-1 rounded hover:bg-slate-950/40 transition">
               <div class="flex justify-between text-[11px] font-medium">
-                <span class="text-slate-300">${item.name}</span>
-                <span class="text-amber-400 font-semibold">${item.count} 次</span>
+                <span class="text-slate-350 font-bold">${item.name}</span>
+                <span class="text-amber-400 font-bold">${item.count} 次</span>
               </div>
               <div class="h-2 w-full bg-slate-950/60 rounded-full overflow-hidden border border-slate-800/40">
                 <div class="h-full bg-gradient-to-r from-cyan-400 to-blue-500 rounded-full shadow-[0_0_8px_rgba(6,182,212,0.3)]" style="width: ${percentage}%"></div>
