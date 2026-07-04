@@ -412,9 +412,10 @@ class FlameDetector:
         # 在图像上绘制每个检测目标的红色边界框和标签
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)  # BGR 红色框
+            color = (0, 165, 255) if det["class_name"] == "smoke" else (0, 0, 255)  # Smoke: Orange, Fire: Red
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             label = f"{det['class_name']}: {det['confidence']:.2f}"
-            cv2.putText(img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         # 生成带时间戳的文件名: 事件ID_日期时间.jpg
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -653,31 +654,37 @@ class FlameDetector:
         :param frame: 触发告警的当前帧图像 (numpy 数组)
         :param result: ultralytics 检测结果对象
         """
-        detections = self.get_detection_info(result, frame.shape)
-        if not detections:
-            return
-        if not self.should_trigger_alarm(detections):
-            return
+        try:
+            detections = self.get_detection_info(result, frame.shape)
+            if not detections:
+                self.recording = False
+                return
+            if not self.should_trigger_alarm(detections):
+                self.recording = False
+                return
 
-        # 生成全局唯一的告警事件 ID: FLAME_日期时间_6位随机Hex
-        event_id = f"FLAME_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6].upper()}"
-        logger.info(f"FLAME DETECTED! Event: {event_id}, Objects: {len(detections)}")
+            # 生成全局唯一的告警事件 ID: FLAME_日期时间_6位随机Hex
+            event_id = f"FLAME_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6].upper()}"
+            logger.info(f"FLAME DETECTED! Event: {event_id}, Objects: {len(detections)}")
 
-        # 步骤1: 保存告警图片
-        image_path, image_filename = self.save_alarm_image(frame, detections, event_id)
+            # 步骤1: 保存告警图片
+            image_path, image_filename = self.save_alarm_image(frame, detections, event_id)
 
-        # 步骤2: 开始录制视频, 持续 cfg.video_duration 秒
-        h, w = frame.shape[:2]
-        writer_entry = self.start_recording(w, h)
-        time.sleep(self.cfg.video_duration)  # 等待指定时长采集足够画面
-        video_path, video_filename = self.stop_recording(writer_entry)
+            # 步骤2: 开始录制视频, 持续 cfg.video_duration 秒
+            h, w = frame.shape[:2]
+            writer_entry = self.start_recording(w, h)
+            time.sleep(self.cfg.video_duration)  # 等待指定时长采集足够画面
+            video_path, video_filename = self.stop_recording(writer_entry)
 
-        # 步骤3: 上报告警到服务端
-        success = self.send_alarm_to_server(image_path, image_filename, video_path, video_filename, detections)
-        if success:
-            logger.info(f"Alarm event {event_id} processed")
-        else:
-            logger.warning(f"Alarm event {event_id} saved locally but not sent to server")
+            # 步骤3: 上报告警到服务端
+            success = self.send_alarm_to_server(image_path, image_filename, video_path, video_filename, detections)
+            if success:
+                logger.info(f"Alarm event {event_id} processed")
+            else:
+                logger.warning(f"Alarm event {event_id} saved locally but not sent to server")
+        except Exception as e:
+            logger.error(f"Error in process_alarm: {e}")
+            self.recording = False
 
     # ========================================================================
     # 设备注册与心跳
@@ -707,6 +714,8 @@ class FlameDetector:
                 "memory_usage": self._get_memory_usage(), # 实时内存使用率
                 "websocket_port": ws_port,               # 告知服务端 WebSocket 端口, 供前端连接
                 "location": self.cfg.location,
+                "latitude": getattr(self.cfg, "latitude", None),
+                "longitude": getattr(self.cfg, "longitude", None),
             }
             resp = requests.post(url, json=data, timeout=10, proxies={"http": None, "https": None})  # timeout=10: 心跳超时不宜过长
             return resp.status_code == 200
@@ -930,15 +939,6 @@ class FlameDetector:
                 # ---------- 帧缓冲: 保留最近 60 帧供告警录像回溯 ----------
                 self.frame_buffer.append(frame.copy())
 
-                # ---------- 录像写入: 如果正在录像, 将当前帧写入所有活跃视频中 ----------
-                if self.recording:
-                    with self._frame_lock:
-                        for entry in list(self.active_writers):
-                            try:
-                                entry["writer"].write(frame)
-                            except Exception as e:
-                                logger.error(f"Error writing frame to safe video writer: {e}")
-
                 # ---------- 检测推理 ----------
                 if getattr(self, "is_mock", False):
                     # 模拟模式下不执行实际检测, 避免无模型时的错误
@@ -952,9 +952,19 @@ class FlameDetector:
                 annotated = frame.copy()
                 for det in detections:
                     x1, y1, x2, y2 = det["bbox"]
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    color = (0, 165, 255) if det["class_name"] == "smoke" else (0, 0, 255)  # Smoke: Orange, Fire: Red
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(annotated, f"{det['class_name']} {det['confidence']:.2f}",
-                                (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                                (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+                # ---------- 录像写入: 如果正在录像, 将绘制了边界框的帧写入所有活跃视频中 ----------
+                if self.recording:
+                    with self._frame_lock:
+                        for entry in list(self.active_writers):
+                            try:
+                                entry["writer"].write(annotated)
+                            except Exception as e:
+                                logger.error(f"Error writing frame to safe video writer: {e}")
 
                 # 更新 WebSocket 推送用的最新帧
                 self.set_latest_frame(annotated)
@@ -968,6 +978,7 @@ class FlameDetector:
                         last_print = time.time()
                     # 非录像状态下检测到目标则触发告警处理(在独立线程中执行)
                     if not self.recording:
+                        self.recording = True
                         threading.Thread(
                             target=self.process_alarm,
                             args=(frame.copy(), result),
