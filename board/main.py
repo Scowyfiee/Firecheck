@@ -13,6 +13,43 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 # 将当前目录加入模块搜索路径，便于导入同目录下的 flame_detect 模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import traceback
+import requests
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    # 打印错误到终端
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    # 尝试将崩溃堆栈上报给 Web 服务端
+    try:
+        from flame_detect import Config
+        config_path = os.path.join(os.path.dirname(__file__), "flame_config.json")
+        cfg = Config(config_path)
+
+        # 动态解析服务端 IP
+        server_ip = "127.0.0.1"
+        if "://" in cfg.server_url:
+            server_ip = cfg.server_url.split("//")[-1].split(":")[0]
+
+        report_url = f"http://{server_ip}:5000/api/device/error"
+        err_stack = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+
+        payload = {
+            "device_id": getattr(cfg, "device_id", 1),
+            "device_mac": getattr(cfg, "device_mac", "AAABBBCCCDDD"),
+            "error_code": "算法崩溃",
+            "error_msg": f"Python 异常退出: {exc_value}\n{err_stack[-400:]}"
+        }
+        requests.post(report_url, json=payload, timeout=3.0)
+    except Exception:
+        pass
+
+sys.excepthook = global_exception_handler
+
 from flame_detect import FlameDetector, Config
 
 def show_interactive_menu():

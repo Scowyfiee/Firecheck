@@ -36,7 +36,12 @@ import cv2                      # OpenCV: 视频流采集、图像处理、视�
 import numpy as np              # 数值计算: 图像数组操作、推理输入预处理
 import requests                 # HTTP 客户端: 发送告警数据和心跳到服务端
 import websockets               # WebSocket 服务端: 推送实时检测画面帧给前端
-from ultralytics import YOLO    # Ultralytics YOLO: YOLOv11 模型加载、训练、推理
+HAS_ULTRALYTICS = False
+try:
+    from ultralytics import YOLO
+    HAS_ULTRALYTICS = True
+except ImportError:
+    pass    # Ultralytics YOLO: YOLOv11 模型加载、训练、推理
 
 # ---------- 日志系统配置 ----------
 # 同时输出到控制台和 flame_detect.log 文件, 方便现场排查和长期归档
@@ -177,7 +182,7 @@ class FlameDetector:
 
         # ---- 告警冷却机制: 防止同一类目短时间重复告警 ----
         self.alarm_cooldown = {}        # {class_id: last_alarm_timestamp}, 记录每个类目上次告警时间
-        self.cooldown_seconds = 15      # 冷却间隔(秒), 同一类目在此时间内不再触发
+        self.cooldown_seconds = 60      # 冷却间隔(秒), 同一类目在此时间内不再触发
 
         # ---- 帧缓冲区: 用于录像回溯 ----
         self.frame_buffer = deque(maxlen=60)  # 保留最近 60 帧, 告警时回写进录像开头, 确保不丢失检测前画面
@@ -209,8 +214,13 @@ class FlameDetector:
 
         注意: 模型路径支持相对路径, 会自动相对于本脚本所在目录解析。
         """
+        if not HAS_ULTRALYTICS:
+            logger.warning("ultralytics (YOLO) is not installed. Entering lightweight simulation mode (is_mock = True) to save CPU/RAM.")
+            self.is_mock = True
+            return
+
         model_path = self.cfg.model_path
-        # 路径解析: 相对路径 → 相对于脚本所在 board 目录的绝对路径
+        # 路径解析: 相对路径 → 相对于脚本所在 board 目录 of 绝对路径
         if not os.path.isabs(model_path):
             board_dir = os.path.dirname(os.path.abspath(__file__))
             resolved_path = os.path.abspath(os.path.join(board_dir, model_path))
@@ -436,35 +446,45 @@ class FlameDetector:
     def start_recording(self, frame_w=1280, frame_h=720):
         """
         开始录制告警视频（线程安全）。
-        先将帧缓冲区中的历史帧回写到录像开头, 确保视频包含检测触发前的画面上下文。
-        返回该次录像的 writer_entry 信息字典。
+        为了彻底杜绝 ARM 平台上部分 MP4 编码器（如 mp4v, avc1/h264_v4l2m2m）因 PTS 错乱引起的 Segmentation fault 崩溃，
+        直接使用最稳健的 MJPG 编码器录制为临时 .avi 视频，录像结束后再通过 ffmpeg 进行极速且安全的 H.264 MP4 转码。
         """
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"alarm_{ts}.mp4"
+        filename = f"alarm_{ts}.avi"
         filepath = os.path.join(self.cfg.save_dir, filename)
 
         fps = getattr(self, "fps", 20.0)
         if fps <= 0:
             fps = 20.0
 
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*"avc1")
-            writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
-            if not writer.isOpened():
-                raise Exception("avc1 writer not opened")
-        except Exception:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
+        writer = None
+        for codec in ["MJPG", "XVID"]:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
+                if writer.isOpened():
+                    logger.info(f"VideoWriter successfully opened with codec: {codec}")
+                    break
+            except Exception as e:
+                logger.warning(f"Codec {codec} failed: {e}")
 
-        # 将帧缓冲区中尺寸匹配的历史帧写入视频开头, 实现"回溯录像"
-        for f in list(self.frame_buffer):
+        # 如果所有编码器都打开失败，记录错误并安全返回 None，防止后续调用 writer.write(f) 发生段错误
+        if writer is None or not writer.isOpened():
+            logger.error("Failed to open VideoWriter with MJPG/XVID codecs, recording will be skipped.")
+            return None
+
+        with self._frame_lock:
+            history_frames = list(self.frame_buffer)
+            self.frame_buffer.clear()
+
+        for f in history_frames:
             fh, fw = f.shape[:2]
             if fw == frame_w and fh == frame_h:
                 try:
-                    writer.write(f)
+                    if writer and writer.isOpened():
+                        writer.write(f)
                 except Exception as e:
                     logger.error(f"Error writing buffered frame: {e}")
-        self.frame_buffer.clear()
 
         writer_entry = {
             "writer": writer,
@@ -503,16 +523,16 @@ class FlameDetector:
             filepath = entry["filepath"]
             filename = entry["filename"]
 
-            try:
-                writer.release()
-            except Exception as e:
-                logger.error(f"Error releasing video writer: {e}")
-
             with self._frame_lock:
                 if entry in self.active_writers:
                     self.active_writers.remove(entry)
                 if not self.active_writers:
                     self.recording = False
+
+            try:
+                writer.release()
+            except Exception as e:
+                logger.error(f"Error releasing video writer: {e}")
 
             last_filepath = filepath
             last_filename = filename
@@ -533,6 +553,7 @@ class FlameDetector:
                 for encoder in ["libx264", "libopenh264"]:
                     try:
                         cmd = [
+                            "nice", "-n", "19",
                             ffmpeg_cmd, "-y", "-i", filepath,
                             "-vcodec", encoder,
                             "-pix_fmt", "yuv420p",
@@ -542,7 +563,19 @@ class FlameDetector:
                         ]
                         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35)
                         if res.returncode == 0 and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                            os.replace(temp_path, filepath)
+                            if filepath.endswith(".avi"):
+                                mp4_path = filepath.replace(".avi", ".mp4")
+                                mp4_filename = filename.replace(".avi", ".mp4")
+                                os.replace(temp_path, mp4_path)
+                                if os.path.exists(filepath):
+                                    try: os.remove(filepath)
+                                    except: pass
+                                filepath = mp4_path
+                                filename = mp4_filename
+                                last_filepath = filepath
+                                last_filename = filename
+                            else:
+                                os.replace(temp_path, filepath)
                             logger.info(f"Video transcoded successfully to H.264 via ffmpeg ({encoder})")
                             transcode_success = True
                             break
@@ -583,7 +616,7 @@ class FlameDetector:
             files = {}
             with open(image_path, "rb") as f:
                 files["picture"] = (image_filename, f.read(), "image/jpeg")
-            if os.path.exists(video_path):
+            if video_path and os.path.exists(video_path):
                 with open(video_path, "rb") as f:
                     files["video"] = (video_filename, f.read(), "video/mp4")
 
@@ -638,37 +671,40 @@ class FlameDetector:
         if not detections:
             return False
         now = time.time()
-        # 遍历所有检测到的类别, 只要有任意一个类别未在冷却期内, 就触发告警
+        
+        # 只要检测到的类别中，有任意一个类别不在冷却时间内，就说明达到了告警触发条件
+        trigger = False
         for d in detections:
-            key = str(d["class_id"])  # 用类别 ID 作为冷却键
+            key = str(d["class_id"])
             if key not in self.alarm_cooldown or now - self.alarm_cooldown[key] > self.cooldown_seconds:
-                # 更新该类别的最新告警时间, 重新开始冷却期
+                trigger = True
+                break
+        
+        # 一旦触发告警，同步更新当前帧中检测到的所有类别的冷却时间戳，避免不同类别（如烟和火）短时间内交替触发
+        if trigger:
+            for d in detections:
+                key = str(d["class_id"])
                 self.alarm_cooldown[key] = now
-                return True
-        # 所有类别都在冷却期内, 不触发
+            return True
+            
         return False
 
-    def process_alarm(self, frame, result):
+    def process_alarm(self, frame, detections):
         """
         告警事件处理主流程(在独立线程中运行):
-          1. 提取检测信息
-          2. 冷却判断(避免重复告警)
-          3. 保存告警图片(带检测框标注)
-          4. 录制告警视频(包含检测前后的缓冲区帧)
-          5. 将图片和视频上报到中心服务端
+          1. 保存告警图片(带检测框标注)
+          2. 录制告警视频(包含检测前后的缓冲区帧)
+          3. 将图片和视频上报到中心服务端
 
         整个过程在单独线程中运行, 不阻塞主检测循环。
 
         :param frame: 触发告警的当前帧图像 (numpy 数组)
-        :param result: ultralytics 检测结果对象
+        :param detections: get_detection_info() 返回的检测信息列表
         """
         try:
-            detections = self.get_detection_info(result, frame.shape)
             if not detections:
-                self.recording = False
-                return
-            if not self.should_trigger_alarm(detections):
-                self.recording = False
+                with self._frame_lock:
+                    self.recording = False
                 return
 
             # 生成全局唯一的告警事件 ID: FLAME_日期时间_6位随机Hex
@@ -681,8 +717,14 @@ class FlameDetector:
             # 步骤2: 开始录制视频, 持续 cfg.video_duration 秒
             h, w = frame.shape[:2]
             writer_entry = self.start_recording(w, h)
-            time.sleep(self.cfg.video_duration)  # 等待指定时长采集足够画面
-            video_path, video_filename = self.stop_recording(writer_entry)
+            
+            video_path, video_filename = "", ""
+            if writer_entry:
+                time.sleep(self.cfg.video_duration)  # 等待指定时长采集足够画面
+                video_path, video_filename = self.stop_recording(writer_entry)
+            else:
+                with self._frame_lock:
+                    self.recording = False
 
             # 步骤3: 上报告警到服务端
             success = self.send_alarm_to_server(image_path, image_filename, video_path, video_filename, detections)
@@ -822,11 +864,19 @@ class FlameDetector:
                     with self._frame_lock:
                         f = self._latest_frame.copy() if self._latest_frame is not None else None
 
-                    if f is not None:
-                        # 压缩为 JPEG, 质量 50%: 减少带宽, 降低推送延迟
-                        _, jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                        # 发送二进制 JPEG 数据(比起 base64 编码文本, 更省带宽)
-                        await ws.send(jpg.tobytes())
+                    if f is not None and f.size > 0 and len(f.shape) == 3:
+                        h, w = f.shape[:2]
+                        if w > 0 and h > 0:
+                            # 动态缩放至宽度为 640 以降低传输带宽和 CPU 压缩消耗 (如 1280x720 缩放为 640x360)
+                            if w > 640:
+                                new_h = int(h * (640 / w))
+                                f_small = cv2.resize(f, (640, new_h))
+                            else:
+                                f_small = f
+                            # 压缩为 JPEG, 质量 45%: 降低带宽, 减少网络拥堵
+                            _, jpg = cv2.imencode(".jpg", f_small, [cv2.IMWRITE_JPEG_QUALITY, 45])
+                            # 发送二进制 JPEG 数据(比起 base64 编码文本, 更省带宽)
+                            await ws.send(jpg.tobytes())
 
                     # 帧率控制: 0.04s ≈ 25fps
                     await asyncio.sleep(0.04)
@@ -941,6 +991,10 @@ class FlameDetector:
                             # 仍然失败则短暂休眠后重试(避免 CPU 空转)
                             time.sleep(0.01)
                             continue
+                    if frame is None or frame.size == 0 or len(frame.shape) != 3:
+                        logger.warning("Empty or invalid frame read, skipping.")
+                        time.sleep(0.01)
+                        continue
 
                 frame_count += 1
 
@@ -949,12 +1003,37 @@ class FlameDetector:
 
                 # ---------- 检测推理 ----------
                 if getattr(self, "is_mock", False):
-                    # 模拟模式下不执行实际检测, 避免无模型时的错误
+                    # 模拟模式：不加载并运行 YOLO 模型（避免 CPU 卡死，无需 PyTorch），直接基于帧数生成检测框进行仿真
                     result = None
                     detections = []
+                    h, w = frame.shape[:2]
+                    cx, cy = w // 2, h // 2
+                    cycle_frame = frame_count % 400
+                    if 100 <= cycle_frame < 200:
+                        # 模拟火焰检测 (Fire)
+                        detections.append({
+                            "bbox": [cx - 100, cy - 80, cx + 100, cy + 120],
+                            "confidence": float(0.85 + 0.1 * np.sin(frame_count / 10.0)),
+                            "class_id": 0,
+                            "class_name": "fire"
+                        })
+                    elif 250 <= cycle_frame < 350:
+                        # 模拟烟雾检测 (Smoke)
+                        detections.append({
+                            "bbox": [cx - 120, cy - 150, cx + 120, cy + 50],
+                            "confidence": float(0.72 + 0.1 * np.cos(frame_count / 10.0)),
+                            "class_id": 1,
+                            "class_name": "smoke"
+                        })
                 else:
-                    result = self.detect_frame(frame)
-                    detections = self.get_detection_info(result, frame.shape) if result else []
+                    # 隔帧推理(Frame Skipping): 每5帧执行一次模型推理，其余帧使用缓存结果，极大降低 CPU 负载并提升流流畅度
+                    if frame_count % 5 == 0 or not hasattr(self, "_cached_detections"):
+                        result = self.detect_frame(frame)
+                        self._cached_result = result
+                        self._cached_detections = self.get_detection_info(result, frame.shape) if result else []
+                    
+                    result = getattr(self, "_cached_result", None)
+                    detections = self._cached_detections
 
                 # ---------- 绘制检测框 ----------
                 annotated = frame.copy()
@@ -970,7 +1049,11 @@ class FlameDetector:
                     with self._frame_lock:
                         for entry in list(self.active_writers):
                             try:
-                                entry["writer"].write(annotated)
+                                fh, fw = annotated.shape[:2]
+                                if fw == entry["w"] and fh == entry["h"]:
+                                    entry["writer"].write(annotated)
+                                else:
+                                    logger.warning(f"Frame size mismatch: ({fw}x{fh}) vs writer ({entry['w']}x{entry['h']}), skipping frame")
                             except Exception as e:
                                 logger.error(f"Error writing frame to safe video writer: {e}")
 
@@ -984,12 +1067,12 @@ class FlameDetector:
                         for det in detections:
                             print(f"  🔥 {det['class_name']} conf={det['confidence']:.2f}")
                         last_print = time.time()
-                    # 非录像状态下检测到目标则触发告警处理(在独立线程中执行)
-                    if not self.recording:
+                    # 非录像状态下检测到目标且不处于冷却期，则触发告警处理(在独立线程中执行)
+                    if not self.recording and self.should_trigger_alarm(detections):
                         self.recording = True
                         threading.Thread(
                             target=self.process_alarm,
-                            args=(frame.copy(), result),
+                            args=(frame.copy(), detections),
                             daemon=True
                         ).start()
 

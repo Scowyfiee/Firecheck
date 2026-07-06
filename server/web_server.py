@@ -418,11 +418,11 @@ def seed_data():
 
 def check_and_log_faults(db):
     """自适应在线/离线故障检测：检查 T_Device 表中设备的最后连接时间，
-    如果心跳超时超过 15 秒且设备为 'no' (未产生离线错误)，则自动生成离线记录。
+    如果心跳超时超过 90 秒且设备为 'no' (未产生离线错误)，则自动生成离线记录。
     """
     try:
         now = datetime.now()
-        threshold = (now - timedelta(seconds=15)).strftime("%Y-%m-%d %H:%M:%S")
+        threshold = (now - timedelta(seconds=90)).strftime("%Y-%m-%d %H:%M:%S")
         now_str = now.strftime("%Y-%m-%d %H:%M:%S")
         
         # 查找超时的在线设备
@@ -439,7 +439,7 @@ def check_and_log_faults(db):
             # 记录分析盒故障日志
             db.execute(
                 "INSERT INTO T_DeviceError (DeviceId, MAC, CreateTime, ErrorCode, ErrorMsg) VALUES (?,?,?,?,?)",
-                (dev_id, mac, now_str, "设备离线", f"AI分析盒 [{addr}] 与云端失去心跳连接 (超时超过15秒)")
+                (dev_id, mac, now_str, "设备离线", f"AI分析盒 [{addr}] 与云端失去心跳连接 (超时超过90秒)")
             )
             
             # 查找该分析盒下的摄像头并记录故障
@@ -601,9 +601,9 @@ def dashboard():
     false_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='误报无需处理'").fetchone()["c"]
     missed_count = db.execute("SELECT COUNT(*) as c FROM T_DetectResult WHERE OperateResult='漏报记录'").fetchone()["c"]
 
-    # 最新报警列表（未处理优先，置信度降序，时间降序）
+    # 最新报警列表（纯时间降序，按时间顺序排列）
     recent_alarms = [dict(r) for r in db.execute(
-        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY (CASE WHEN dr.Status='1' THEN 1 WHEN dr.OperateResult='误报无需处理' THEN 4 WHEN dr.OperateResult='漏报记录' THEN 3 ELSE 2 END) ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
+        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.CreatTime DESC LIMIT 30").fetchall()]
 
     # 最早报警时间（用于数据大屏时间轴起始点）
     earliest_row = db.execute("SELECT MIN(CreatTime) as m FROM T_DetectResult").fetchone()
@@ -617,8 +617,8 @@ def dashboard():
     # 所有摄像头列表（用于地图标注）
     cameras = [dict(r) for r in db.execute("SELECT * FROM T_Camera ORDER BY Id").fetchall()]
 
-    # 在线/离线设备统计 (心跳周期 30s，允许 60s 宽限期)
-    online_threshold = (datetime.now() - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
+    # 在线/离线设备统计 (心跳周期 60s，允许 90s 宽限期)
+    online_threshold = (datetime.now() - timedelta(seconds=90)).strftime("%Y-%m-%d %H:%M:%S")
     online_count = db.execute("SELECT COUNT(*) as c FROM T_Device WHERE LastConnectTime >= ?", (online_threshold,)).fetchone()["c"]
     offline_count = max(0, total_devices - online_count)
 
@@ -942,7 +942,7 @@ def device_list():
         if d.get("LastConnectTime"):
             try:
                 lct = datetime.strptime(d["LastConnectTime"], "%Y-%m-%d %H:%M:%S")
-                d["status"] = "online" if (now - lct).total_seconds() <= 15 else "offline"
+                d["status"] = "online" if (now - lct).total_seconds() <= 90 else "offline"
             except Exception:
                 d["status"] = "offline"
         else:
@@ -1024,7 +1024,7 @@ def camera_list():
         if c.get("LastConnectTime"):
             try:
                 lct = datetime.strptime(c["LastConnectTime"], "%Y-%m-%d %H:%M:%S")
-                c["status"] = "online" if (now - lct).total_seconds() <= 15 else "offline"
+                c["status"] = "online" if (now - lct).total_seconds() <= 90 else "offline"
             except Exception:
                 c["status"] = "offline"
         else:
@@ -1345,11 +1345,26 @@ def api_heartbeat():
             port = data.get("websocket_port")
             lat = data.get("latitude")
             lng = data.get("longitude")
+            client_ip = request.remote_addr
+            if client_ip == "::1":
+                client_ip = "127.0.0.1"
+            camera_url = f"ws://{client_ip}:{port}"
+            
             camera = db.execute("SELECT * FROM T_Camera WHERE Id=?", (camera_id,)).fetchone()
             if camera:
-                db.execute("UPDATE T_Camera SET Name=COALESCE(?, Name), WsPort=COALESCE(?, WsPort), Latitude=COALESCE(?, Latitude), Longitude=COALESCE(?, Longitude) WHERE Id=?", (loc, port, lat, lng, camera_id))
+                db.execute("""UPDATE T_Camera 
+                              SET Name=COALESCE(?, Name), 
+                                  WsPort=COALESCE(?, WsPort), 
+                                  Latitude=COALESCE(?, Latitude), 
+                                  Longitude=COALESCE(?, Longitude),
+                                  IP=?, 
+                                  CameraUrl=? 
+                              WHERE Id=?""", 
+                           (loc, port, lat, lng, client_ip, camera_url, camera_id))
             else:
-                db.execute("INSERT INTO T_Camera (Id, Name, WsPort, DeviceId, Latitude, Longitude) VALUES (?, ?, ?, ?, ?, ?)", (camera_id, loc, port, did, lat, lng))
+                db.execute("""INSERT INTO T_Camera (Id, Name, WsPort, DeviceId, Latitude, Longitude, IP, CameraUrl) 
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", 
+                           (camera_id, loc, port, did, lat, lng, client_ip, camera_url))
         db.commit()
         # 读取系统配置并返回给设备
         site = db.execute("SELECT * FROM T_Site WHERE Id=1").fetchone()
@@ -1625,7 +1640,7 @@ def api_stats():
     cameras = [dict(r) for r in db.execute("SELECT * FROM T_Camera ORDER BY Id").fetchall()]
 
     recent_alarms = [dict(r) for r in db.execute(
-        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY (CASE WHEN dr.Status='1' THEN 1 WHEN dr.OperateResult='误报无需处理' THEN 4 WHEN dr.OperateResult='漏报记录' THEN 3 ELSE 2 END) ASC, dr.Confidence DESC, dr.CreatTime DESC LIMIT 30").fetchall()]
+        "SELECT dr.*, c.Name as CameraName, a.Name as AreaName, u.Name as OperatorName FROM T_DetectResult dr LEFT JOIN T_Camera c ON dr.CameraId=c.Id LEFT JOIN T_Area a ON dr.AreaId=a.Id LEFT JOIN T_User u ON dr.OperateUserId=u.Id ORDER BY dr.CreatTime DESC LIMIT 30").fetchall()]
 
     return jsonify({
         "area_stats": area,
@@ -2336,14 +2351,29 @@ setInterval(upd,1000);
 // WebSocket connection and Dynamic Discovery Port Scanner
 var ws=null,wsReconnectTimer=null,wsReconnectDelay=1000;
 var discoveredCameras = {}; // camera_id -> {id, name, port, location, host}
+// Pre-populate already registered cameras from the database
+{% for cam in cameras %}
+  {% if cam.IP and cam.WsPort %}
+  discoveredCameras[{{ cam.Id }}] = {
+    id: {{ cam.Id }},
+    name: '{{ (cam.Name or "Camera " ~ cam.Id) | replace("\'", "\\\'") }}',
+    port: {{ cam.WsPort }},
+    location: '{{ (cam.Name or "Camera " ~ cam.Id) | replace("\'", "\\\'") }}',
+    host: '{{ cam.IP }}'
+  };
+  {% endif %}
+{% endfor %}
 var scanningIntervalId = null;
-
-// Do not pre-populate from database to ensure a clean slate 0-device start.
-// Devices will only appear once successfully discovered and connected via the port scanner.
 
 // Initialize Scanner on load
 function initScanner() {
   updateCameraSelectorUI();
+  
+  // 如果数据库中已经存在已注册的摄像头，直接使用其 IP，不应该在加载时自动进行局域网扫描覆写
+  if (Object.keys(discoveredCameras).length > 0) {
+    console.log('[Scanner] Camera already loaded from DB. Skipping auto-scanning on load.');
+    return;
+  }
   
   const scanIntervalSec = parseInt(document.getElementById('scanIntervalInput').value) || 1;
   if (scanningIntervalId) clearInterval(scanningIntervalId);
@@ -2578,7 +2608,7 @@ function wsConnect() {
         const info = JSON.parse(e.data);
         if (info.type === 'camera_info') {
           console.log('[WS] Stream info handshake:', info);
-          registerDiscoveredCamera(info);
+          registerDiscoveredCamera(info, host);
         }
       } catch(err) {
         console.error('[WS] Parse message error:', err);
@@ -3244,20 +3274,8 @@ function fetchRealtimeData() {
         });
       }
 
-      // Sort filteredAlarms locally
+      // Sort filteredAlarms locally (pure chronological order, newest first)
       filteredAlarms.sort((a, b) => {
-        const getRank = (item) => {
-          if (item.Status === '1') return 1;
-          if (item.OperateResult === '误报无需处理') return 4;
-          if (item.OperateResult === '漏报记录') return 3;
-          return 2;
-        };
-        const rA = getRank(a);
-        const rB = getRank(b);
-        if (rA !== rB) return rA - rB;
-        const cA = parseFloat(a.Confidence) || 0;
-        const cB = parseFloat(b.Confidence) || 0;
-        if (cA !== cB) return cB - cA;
         return new Date(b.CreatTime ? b.CreatTime.replace(' ', 'T') : 0) - new Date(a.CreatTime ? a.CreatTime.replace(' ', 'T') : 0);
       });
 
@@ -3665,7 +3683,6 @@ document.addEventListener("DOMContentLoaded", function() {
   }
   
   initScanner();
-  wsConnect();
   
   fetchRealtimeData();
   setInterval(fetchRealtimeData, 2000);
