@@ -1,11 +1,6 @@
 # 数据集
 fire_dataset/
 
-# 训练产物
-board/runs/
-board/models/
-runs/
-
 # Python
 __pycache__/
 *.pyc

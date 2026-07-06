@@ -1,0 +1,17 @@
+{
+  "dataset": "Smoke-Fire-Detection-YOLO",
+  "model": "yolov11",
+  "train_images": 14122,
+  "val_images": 3099,
+  "classes": {
+    "0": "smoke",
+    "1": "fire"
+  },
+  "metrics": {
+    "mAP50": 0.7506472110531666,
+    "mAP50-95": 0.4358564851663588,
+    "precision": 0.7664180944379075,
+    "recall": 0.6792003622935836
+  },
+  "train_time": "2026-06-11T23:30:55.989024"
+}
