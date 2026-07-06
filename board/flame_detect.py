@@ -280,6 +280,14 @@ class FlameDetector:
         若摄像头无法打开, 自动进入模拟画面模式(is_mock=True), 用于无摄像头的开发调试。
         """
         cam = self.cfg.camera_url
+        if isinstance(cam, str) and not cam.isdigit() and not cam.startswith("rtsp://") and not cam.startswith("http://") and not cam.startswith("https://"):
+            if not os.path.exists(cam):
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                parent_dir = os.path.dirname(script_dir)
+                alt_path = os.path.join(parent_dir, cam)
+                if os.path.exists(alt_path):
+                    cam = alt_path
+                    logger.info(f"Resolved relative video path to: {cam}")
         try:
             # 判断摄像头地址类型: 纯数字 → 本地摄像头索引, 其他 → 视频流 URL/文件路径
             if isinstance(cam, int) or (isinstance(cam, str) and cam.isdigit()):
